@@ -1,4 +1,10 @@
 import { useState } from 'react'
+import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 
 export default function SqlBlock({ sql }) {
   const [open, setOpen] = useState(false)
@@ -6,7 +12,8 @@ export default function SqlBlock({ sql }) {
 
   if (!sql?.trim()) return null
 
-  const handleCopy = async () => {
+  const handleCopy = async (e) => {
+    e.stopPropagation()
     try {
       await navigator.clipboard.writeText(sql)
       setCopied(true)
@@ -17,51 +24,26 @@ export default function SqlBlock({ sql }) {
   }
 
   return (
-    <div className="sql-block">
-      <button
-        type="button"
-        className="sql-block-toggle"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-      >
-        <span className="sql-block-chevron">{open ? '▼' : '▶'}</span>
-        View SQL
-      </button>
-      {open && (
-        <div className="sql-block-panel">
-          <button
+    <Collapsible open={open} onOpenChange={setOpen} className="mt-4 w-full">
+      <CollapsibleTrigger className="font-mono text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer">
+        View SQL {open ? '↑' : '↓'}
+      </CollapsibleTrigger>
+      <CollapsibleContent className="mt-2">
+        <div className="relative rounded border border-[#1a1a1a] bg-[#0a0a0a] p-4">
+          <Button
             type="button"
-            className="sql-block-copy"
+            variant="ghost"
+            size="sm"
+            className="absolute top-2 right-2 h-7 text-xs text-muted-foreground"
             onClick={handleCopy}
-            aria-label="Copy SQL to clipboard"
           >
             {copied ? 'Copied!' : 'Copy'}
-          </button>
-          <pre className="sql-block-code">
-            <code>{highlightSql(sql)}</code>
+          </Button>
+          <pre className="overflow-x-auto pr-16 font-mono text-xs whitespace-pre text-[#888]">
+            {sql}
           </pre>
         </div>
-      )}
-    </div>
+      </CollapsibleContent>
+    </Collapsible>
   )
-}
-
-const KEYWORD_RE =
-  /^(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|GROUP BY|ORDER BY|HAVING|LIMIT|AS|AND|OR|NOT|IN|IS|NULL|DISTINCT|COUNT|SUM|AVG|MIN|MAX|CASE|WHEN|THEN|ELSE|END|BETWEEN|LIKE|DESC|ASC|UNION|ALL|WITH)$/i
-
-const SPLIT_RE =
-  /\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|GROUP BY|ORDER BY|HAVING|LIMIT|AS|AND|OR|NOT|IN|IS|NULL|DISTINCT|COUNT|SUM|AVG|MIN|MAX|CASE|WHEN|THEN|ELSE|END|BETWEEN|LIKE|DESC|ASC|UNION|ALL|WITH)\b/gi
-
-function highlightSql(sql) {
-  return sql.split(SPLIT_RE).map((part, i) => {
-    if (!part) return null
-    if (KEYWORD_RE.test(part)) {
-      return (
-        <span key={i} className="sql-keyword">
-          {part}
-        </span>
-      )
-    }
-    return <span key={i}>{part}</span>
-  })
 }

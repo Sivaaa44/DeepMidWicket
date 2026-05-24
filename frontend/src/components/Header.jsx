@@ -1,17 +1,13 @@
 export default function Header() {
   return (
-    <header className="header">
-      <div className="header-inner">
-        <div className="header-brand">
-          <span className="header-icon" aria-hidden="true">
-            🏏
-          </span>
-          <div>
-            <h1 className="header-title">Cricket Intelligence</h1>
-            <p className="header-subtitle">Powered by AI</p>
-          </div>
-        </div>
-        <span className="header-badge">IPL 2008–2025</span>
+    <header className="fixed top-0 left-0 right-0 z-50 flex h-14 items-center border-b border-[#222] bg-black px-6">
+      <div className="mx-auto flex w-full max-w-3xl items-center justify-between">
+        <h1 className="text-sm font-semibold text-white">
+          🏏 Cricket Intelligence
+        </h1>
+        <p className="text-xs text-muted-foreground">
+          Powered by Groq + LLaMA
+        </p>
       </div>
     </header>
   )
