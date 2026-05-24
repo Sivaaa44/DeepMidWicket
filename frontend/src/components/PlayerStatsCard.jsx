@@ -47,7 +47,7 @@ export default function PlayerStatsCard({ result }) {
           ))}
         </div>
         {answer && (
-          <p className="text-sm italic text-muted-foreground">{answer}</p>
+          <p className="text-sm text-muted-foreground">{answer}</p>
         )}
         <SqlBlock sql={sql} />
       </CardContent>

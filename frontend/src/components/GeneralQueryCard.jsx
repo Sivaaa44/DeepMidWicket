@@ -1,4 +1,4 @@
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import {
   Table,
   TableBody,
@@ -11,19 +11,14 @@ import { formatStatValue } from '@/lib/compare'
 import SqlBlock from './SqlBlock'
 
 export default function GeneralQueryCard({ result }) {
-  const { question, answer, sql, data } = result
+  const { answer, sql, data } = result
   const columns = data?.columns ?? []
   const rows = data?.rows ?? []
   const hasRows = rows.length > 0
 
   return (
     <Card className="border-[#222] bg-black ring-0">
-      <CardHeader className="border-b border-[#222] pb-4">
-        <CardTitle className="text-base font-medium leading-snug text-white">
-          {question}
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-4 pt-4">
+      <CardContent className="space-y-4 py-4">
         {answer && (
           <p className="text-sm leading-relaxed text-foreground">{answer}</p>
         )}

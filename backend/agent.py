@@ -9,7 +9,7 @@ load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
-# ── Tool Definitions (for router) ─────────────────────────────────────────────
+# ── Tool Definitions ──────────────────────────────────────────────────────────
 
 TOOLS = [
     {
@@ -23,7 +23,8 @@ TOOLS = [
                     "player_name":  {"type": "string", "description": "Player name keyword e.g. 'Kohli', 'Bumrah'"},
                     "stat_type":    {"type": "string", "enum": ["batting", "bowling", "allround"]},
                     "phase":        {"type": "string", "enum": ["overall", "powerplay", "middle", "death"]},
-                    "season":       {"type": "string", "description": "e.g. '2024' or null for all seasons"}
+                    "season":       {"type": "string", "description": "e.g. '2024' or null for all seasons"},
+                    "specific_stat": {"type": "string", "description": "If user asks for just one stat e.g. 'wickets', 'runs', 'economy', 'strike rate'. Null if full profile asked."}
                 },
                 "required": ["player_name", "stat_type", "phase"]
             }
@@ -33,18 +34,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "player_comparison",
-            "description": "Compare two players. Works for batter vs batter, bowler vs bowler, OR batter vs bowler head-to-head (how many times one got the other out, runs scored off them, etc).",
+            "description": "Compare two players. Works for batter vs batter, bowler vs bowler, OR batter vs bowler head-to-head.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "player1":      {"type": "string", "description": "First player name keyword"},
-                    "player2":      {"type": "string", "description": "Second player name keyword"},
-                    "comparison_type": {
-                        "type": "string",
-                        "enum": ["batter_vs_batter", "bowler_vs_bowler", "batter_vs_bowler"],
-                        "description": "batter_vs_bowler = head to head matchup, who got who out, runs scored off them"
-                    },
-                    "phase":        {"type": "string", "enum": ["overall", "powerplay", "middle", "death"]}
+                    "player1":          {"type": "string"},
+                    "player2":          {"type": "string"},
+                    "comparison_type":  {"type": "string", "enum": ["batter_vs_batter", "bowler_vs_bowler", "batter_vs_bowler"]},
+                    "phase":            {"type": "string", "enum": ["overall", "powerplay", "middle", "death"]}
                 },
                 "required": ["player1", "player2", "comparison_type", "phase"]
             }
@@ -54,7 +51,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "general_query",
-            "description": "Answer general questions about teams, venues, seasons, records, win rates, toss stats — anything not about one or two specific players.",
+            "description": "Teams, venues, seasons, records, win rates, toss stats, season comparisons for a player, purple cap, orange cap, anything not about one or two players in isolation.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -69,73 +66,74 @@ TOOLS = [
 
 # ── Tool-Specific System Prompts ──────────────────────────────────────────────
 
-PLAYER_STATS_PROMPT = """You are an expert cricket analyst and SQLite query writer specializing in IPL player performance.
+PLAYER_STATS_PROMPT = """You are an expert cricket analyst and SQLite query writer for IPL data.
 
 {schema}
 
-Your job: write a single SQLite SELECT query for individual player stats.
+Write a single SQLite SELECT query for this player stat request.
 
-PLAYER STATS RULES:
-- Always use LIKE '%player_name%' for name matching
-- For batting stats include: matches, runs, balls_faced, strike_rate, average, fours, sixes, highest_score, dismissals
-- For bowling stats include: matches, wickets, balls_bowled, runs_conceded, economy, bowling_average, bowling_sr, best figures
-- For allround: include both batting and bowling in one query using UNION or separate columns
-- Strike rate = SUM(runs_batter) * 100.0 / COUNT(balls where extras_type != 'wides')
-- Economy = SUM(runs_total) * 6.0 / COUNT(balls where extras_type != 'wides')
-- Bowling average = runs_conceded / wickets
-- Bowling SR = balls_bowled / wickets
-- Best figures: find the match where the bowler took most wickets, then least runs in that match
-- Phase filters: powerplay = over 0-5, middle = over 6-14, death = over 15-19
-- Season filter: m.season = 'YYYY' (TEXT, use quotes)
-- Always JOIN matches when filtering by season
+RULES:
+- Use LIKE '%player_name%' for name matching
+- NEVER apply a minimum ball/over threshold for a named player query — thresholds are only for rankings
+- BOWLER WICKETS: always exclude run outs — use SUM(CASE WHEN is_wicket = 1 AND wicket_kind != 'run out' THEN 1 ELSE 0 END)
+- Never use SUM(is_wicket) directly for bowler wicket counts
+- Strike rate = ROUND(SUM(runs_batter) * 100.0 / COUNT(CASE WHEN extras_type IS NULL OR extras_type != 'wides' THEN 1 END), 2)
+- Economy = ROUND(SUM(runs_total) * 6.0 / COUNT(CASE WHEN extras_type IS NULL OR extras_type != 'wides' THEN 1 END), 2)
+- Bowling average = ROUND(runs_conceded * 1.0 / NULLIF(wickets, 0), 2)
+- Bowling SR = ROUND(balls_bowled * 1.0 / NULLIF(wickets, 0), 2)
+- Season filter: JOIN matches m ON d.match_id = m.match_id AND m.season = 'YYYY'
+- Phase: powerplay = over 0-5, middle = over 6-14, death = over 15-19
 
-Return ONLY the raw SQL, no markdown, no explanation.
+BEST FIGURES (keep it simple):
+  best_figures_wickets: (SELECT MAX(wk) FROM (SELECT SUM(CASE WHEN is_wicket=1 AND wicket_kind!='run out' THEN 1 ELSE 0 END) AS wk FROM deliveries WHERE bowler LIKE '%name%' GROUP BY match_id) t)
+  Do NOT calculate best_figures_runs — too complex, omit it.
+
+QUERY SCOPE — match what the user actually asked for:
+- If user asked for just ONE stat (e.g. "how many wickets", "what is his economy"), return ONLY that stat. Do not add unrequested columns.
+- If user asked for a full profile or general stats, return the full relevant stat set for batting or bowling.
+
+Return ONLY raw SQL, no markdown, no explanation.
 
 Player: {player_name}
 Stat type: {stat_type}
 Phase: {phase}
 Season: {season}
+Specific stat requested: {specific_stat}
 
 SQL:"""
 
 
-PLAYER_COMPARISON_PROMPT = """You are an expert cricket analyst and SQLite query writer specializing in IPL head-to-head analysis.
+PLAYER_COMPARISON_PROMPT = """You are an expert cricket analyst and SQLite query writer for IPL data.
 
 {schema}
 
-Your job: write a single SQLite SELECT query to compare two players.
+Write a single SQLite SELECT query to compare two players.
 
-COMPARISON TYPE RULES:
+RULES:
+- BOWLER WICKETS: exclude run outs — SUM(CASE WHEN is_wicket = 1 AND wicket_kind != 'run out' THEN 1 ELSE 0 END)
+- Strike rate = ROUND(SUM(runs_batter) * 100.0 / COUNT(CASE WHEN extras_type IS NULL OR extras_type != 'wides' THEN 1 END), 2)
+- Economy = ROUND(SUM(runs_total) * 6.0 / COUNT(CASE WHEN extras_type IS NULL OR extras_type != 'wides' THEN 1 END), 2)
+- Phase: powerplay = over 0-5, middle = over 6-14, death = over 15-19
+- No minimum thresholds for named player comparisons
 
 For batter_vs_batter:
-- Compare both players' batting stats side by side
-- Include: runs, balls_faced, strike_rate, average, fours, sixes, dismissals
-- Use CASE WHEN batter LIKE '%p1%' THEN 'Player1' ELSE 'Player2' END to label rows
-- Filter: WHERE batter LIKE '%p1%' OR batter LIKE '%p2%'
-- GROUP BY the player label
+  - Filter: WHERE batter LIKE '%p1%' OR batter LIKE '%p2%'
+  - GROUP BY player label using CASE WHEN
+  - Include: runs, balls_faced, strike_rate, average, fours, sixes, dismissals
 
 For bowler_vs_bowler:
-- Compare both players' bowling stats side by side
-- Include: wickets, balls_bowled, economy, bowling_average, bowling_sr
-- Use CASE WHEN bowler LIKE '%p1%' THEN 'Player1' ELSE 'Player2' END
-- Filter: WHERE bowler LIKE '%p1%' OR bowler LIKE '%p2%'
+  - Filter: WHERE bowler LIKE '%p1%' OR bowler LIKE '%p2%'
+  - GROUP BY player label
+  - Include: wickets (excluding run outs), balls_bowled, economy, bowling_average, bowling_sr
 
-For batter_vs_bowler (HEAD TO HEAD MATCHUP):
-- This is the most interesting: how did batter perform against this specific bowler
-- Query: filter WHERE batter LIKE '%batter%' AND bowler LIKE '%bowler%'
-- Include: balls_faced, runs_scored, dismissals (times batter got out to this bowler),
-  strike_rate, dot_balls, fours, sixes, wicket_kinds (caught/bowled/lbw breakdown)
-- Also show: what % of their matchups ended in a wicket
-- Figure out who is the batter and who is the bowler from context
+For batter_vs_bowler (HEAD TO HEAD):
+  - Filter: WHERE batter LIKE '%batter%' AND bowler LIKE '%bowler%'
+  - Figure out who is batter and who is bowler from context
+  - Include: balls_faced, runs_scored, dismissals, strike_rate, dot_balls, fours, sixes
+  - dot_balls = COUNT(CASE WHEN runs_batter = 0 AND (extras_type IS NULL OR extras_type NOT IN ('wides','noballs')) THEN 1 END)
+  - dismissals = SUM(CASE WHEN is_wicket = 1 AND wicket_kind != 'run out' THEN 1 ELSE 0 END)
 
-GENERAL RULES:
-- Strike rate = runs * 100.0 / valid_balls
-- Economy = runs_total * 6.0 / valid_balls  
-- valid_balls = COUNT(CASE WHEN extras_type IS NULL OR extras_type != 'wides' THEN 1 END)
-- Phase: powerplay = over 0-5, middle = over 6-14, death = over 15-19
-- Never use SUM(over) for overs bowled
-
-Return ONLY the raw SQL, no markdown, no explanation.
+Return ONLY raw SQL, no markdown, no explanation.
 
 Player 1: {player1}
 Player 2: {player2}
@@ -149,21 +147,23 @@ GENERAL_QUERY_PROMPT = """You are an expert cricket analyst and SQLite query wri
 
 {schema}
 
-Your job: write a single SQLite SELECT query to answer the question.
+Write a single SQLite SELECT query to answer the question.
 
 RULES:
 - Return ONLY raw SQL, no markdown, no backticks, no explanation
-- Only SELECT queries, never INSERT/UPDATE/DELETE
+- Only SELECT, never INSERT/UPDATE/DELETE
 - Use LIKE '%name%' for player/team name searches
+- BOWLER WICKETS: always use SUM(CASE WHEN is_wicket = 1 AND wicket_kind != 'run out' THEN 1 ELSE 0 END) — never SUM(is_wicket)
+- Economy = ROUND(SUM(runs_total) * 6.0 / COUNT(CASE WHEN extras_type IS NULL OR extras_type != 'wides' THEN 1 END), 2)
+- Strike rate = ROUND(SUM(runs_batter) * 100.0 / COUNT(CASE WHEN extras_type IS NULL OR extras_type != 'wides' THEN 1 END), 2)
 - Never use SUM(over) to calculate overs bowled
-- Economy = SUM(runs_total) * 6.0 / COUNT(valid_balls)
-- Strike rate = SUM(runs_batter) * 100.0 / COUNT(valid_balls)
-- valid_balls = COUNT(CASE WHEN extras_type IS NULL OR extras_type != 'wides' THEN 1 END)
-- Finals filter: WHERE m.match_number = (SELECT MAX(match_number) FROM matches m2 WHERE m2.season = m.season)
-- For ranking bowlers/batters always apply minimum threshold (200 balls for batters, 300 for bowlers)
-- Seasons stored as TEXT: '2008', '2023', '2007/08', '2020/21'
-- Always JOIN matches ON match_id when filtering by season, venue, or team
-- Limit to 15 rows unless a single value is asked for
+- Finals: WHERE m.match_number = (SELECT MAX(match_number) FROM matches m2 WHERE m2.season = m.season)
+- Minimum thresholds for rankings: 200 balls for batters, 300 balls for bowlers
+- Seasons are TEXT: '2008', '2023', '2007/08', '2020/21'
+- Always JOIN matches when filtering by season, venue, or city
+- Limit to 15 rows unless a single value is requested
+- QUERY SCOPE: if user asks one specific thing, return only that. Don't add unrequested columns.
+- If comparing a player across seasons, GROUP BY m.season and return both seasons in one query
 
 Question: {question}
 
@@ -179,14 +179,16 @@ def route_question(question: str) -> dict:
             {
                 "role": "system",
                 "content": (
-                    "You are a cricket analytics router. Pick the right tool based on the question.\n"
-                    "- player_stats: one player mentioned, asking about their performance\n"
-                    "- player_comparison: two players mentioned OR head-to-head matchup (batter vs bowler)\n"
-                    "- general_query: teams, venues, seasons, records, win rates, anything else\n"
-                    "For player_comparison, set comparison_type carefully:\n"
-                    "  batter_vs_batter = two batters compared\n"
-                    "  bowler_vs_bowler = two bowlers compared\n"
-                    "  batter_vs_bowler = one batter one bowler, head to head matchup"
+                    "You are a cricket analytics router. Pick the right tool.\n\n"
+                    "player_stats: one named player, asking about their performance stats\n"
+                    "  - Set specific_stat if user asks for just one thing e.g. 'wickets', 'runs', 'economy'\n"
+                    "  - Set specific_stat=null if user wants full stats or a profile\n\n"
+                    "player_comparison: two players being compared OR head-to-head matchup\n"
+                    "  - batter_vs_batter: two batters\n"
+                    "  - bowler_vs_bowler: two bowlers\n"
+                    "  - batter_vs_bowler: one batter one bowler, head to head\n\n"
+                    "general_query: teams, venues, records, season comparisons, purple/orange cap, "
+                    "win rates, toss stats, or comparing same player across multiple seasons\n"
                 )
             },
             {"role": "user", "content": question}
@@ -195,9 +197,6 @@ def route_question(question: str) -> dict:
         tool_choice="required",
         temperature=0,
     )
-    print("response of router: ", response)
-    print("tool called: ", response.choices[0].message.tool_calls[0])
-
     return response.choices[0].message.tool_calls[0]
 
 
@@ -218,35 +217,42 @@ def generate_sql(prompt: str) -> str:
 
 def generate_answer(question: str, tool: str, comparison_type: str, columns: list, rows: list) -> str:
     if not rows:
-        return "I couldn't find any data matching your question. Try rephrasing or check the player/team name."
+        return "No data found. Try rephrasing or check the player/team name."
 
     results_text = " | ".join(columns) + "\n" + "-" * 60 + "\n"
     for row in rows[:20]:
         results_text += " | ".join(str(v) for v in row.values()) + "\n"
 
     context = {
-        "player_stats":     "Give a detailed breakdown of this player's numbers. Highlight what stands out.",
+        "player_stats":      "Give a concise factual breakdown. Highlight what stands out.",
         "player_comparison": (
-            "Compare these two players head to head. Be direct about who comes out on top and in which areas."
+            "Compare directly. Say who comes out on top and in which areas."
             if comparison_type != "batter_vs_bowler"
-            else "Analyze this batter vs bowler head-to-head. Who has the upper hand? How many times has the bowler dismissed the batter? What's the batter's strike rate against them?"
+            else "Analyze this head-to-head. Who has the upper hand? Mention dismissals and strike rate."
         ),
-        "general_query":    "Answer directly. Lead with the key stat or finding."
-    }.get(tool, "Answer clearly and concisely.")
+        "general_query": "Answer directly. Lead with the key stat or finding."
+    }.get(tool, "Answer clearly.")
 
-    prompt = f"""You are a sharp cricket analyst commenting on IPL data.
+    prompt = f"""You are a cricket analyst giving factual IPL insights.
+
 User asked: "{question}"
 {context}
 
 Data:
 {results_text}
 
-Keep it under 100 words. Be direct. Sound like a cricket analyst."""
+Rules:
+- Be direct and factual
+- Never say "no wait", "actually", "hmm" or correct yourself mid-sentence
+- Lead with the answer in the first sentence
+- Under 80 words
+- Sound like ESPNCricinfo, not a chatbot"""
+
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        max_completion_tokens=300,
+        temperature=0.3,
+        max_completion_tokens=200,
     )
     return response.choices[0].message.content.strip()
 
@@ -255,12 +261,10 @@ Keep it under 100 words. Be direct. Sound like a cricket analyst."""
 
 def ask(question: str) -> dict:
     try:
-        # Step 1: route
         tool_call = route_question(question)
         tool_name = tool_call.function.name
         args      = json.loads(tool_call.function.arguments)
 
-        # Step 2: build prompt for the right tool
         schema = get_schema()
 
         if tool_name == "player_stats":
@@ -269,7 +273,8 @@ def ask(question: str) -> dict:
                 player_name=args.get("player_name"),
                 stat_type=args.get("stat_type"),
                 phase=args.get("phase", "overall"),
-                season=args.get("season") or "all seasons"
+                season=args.get("season") or "all seasons",
+                specific_stat=args.get("specific_stat") or "null"
             )
         elif tool_name == "player_comparison":
             prompt = PLAYER_COMPARISON_PROMPT.format(
@@ -285,11 +290,9 @@ def ask(question: str) -> dict:
                 question=question
             )
 
-        # Step 3: generate and run SQL
         sql = generate_sql(prompt)
         columns, rows = run_query(sql)
 
-        # Step 4: generate answer
         comparison_type = args.get("comparison_type", "")
         answer = generate_answer(question, tool_name, comparison_type, columns, rows)
 

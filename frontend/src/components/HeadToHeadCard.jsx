@@ -38,7 +38,7 @@ export default function HeadToHeadCard({ result }) {
           ))}
         </div>
         {answer && (
-          <p className="text-sm italic text-muted-foreground">{answer}</p>
+          <p className="text-sm text-muted-foreground">{answer}</p>
         )}
         <SqlBlock sql={sql} />
       </CardContent>

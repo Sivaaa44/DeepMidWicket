@@ -78,7 +78,7 @@ export default function ComparisonCard({ result }) {
           </TableBody>
         </Table>
         {answer && (
-          <p className="text-sm italic text-muted-foreground">{answer}</p>
+          <p className="text-sm text-muted-foreground">{answer}</p>
         )}
         <SqlBlock sql={sql} />
       </CardContent>
