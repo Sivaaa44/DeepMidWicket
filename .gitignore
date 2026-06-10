@@ -8,3 +8,5 @@ frontend/.env.local
 node_modules/
 dist/
 ipl_json/
+backend/logs/
+

@@ -1,9 +1,50 @@
 import os
 import re
 import json
+import time
+from functools import wraps
 from groq import Groq
 from dotenv import load_dotenv
 from database import run_query, get_schema
+
+# Setup logging
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "agent.log")
+
+def write_log(line: str):
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        try:
+            print(line.replace("→", "->"))
+        except Exception:
+            pass
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def timing(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        duration = time.time() - start_time
+        write_log(f"[timing] {func.__name__} → {duration:.2f}s")
+        return result
+    return wrapper
+
+run_query = timing(run_query)
+
+def sanitise(value) -> str:
+    if value is None:
+        return ""
+    val = str(value).strip()
+    for char in ["'", '"', ';', '\\']:
+        val = val.replace(char, '')
+    return val
 
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -56,6 +97,20 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "question": {"type": "string"}
+                },
+                "required": ["question"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "general_chat",
+            "description": "Greetings, chat, questions about how the app works, app status, or generic queries that do NOT need SQL stats database queries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The generic chat question or greeting"}
                 },
                 "required": ["question"]
             }
@@ -170,8 +225,22 @@ Question: {question}
 SQL:"""
 
 
+GENERAL_CHAT_PROMPT = """You are a helpful cricket intelligence assistant.
+Answer the user's question directly and concisely.
+
+User asked: "{question}"
+
+Rules:
+- Be helpful, conversational, and direct.
+- Do not mention or generate SQL queries.
+- If the user asks about the app, explain that this is a Cricket Intelligence App that allows querying IPL statistics, comparing players, and checking match records.
+- Keep it under 100 words.
+"""
+
+
 # ── Router ────────────────────────────────────────────────────────────────────
 
+@timing
 def route_question(question: str) -> dict:
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -188,7 +257,8 @@ def route_question(question: str) -> dict:
                     "  - bowler_vs_bowler: two bowlers\n"
                     "  - batter_vs_bowler: one batter one bowler, head to head\n\n"
                     "general_query: teams, venues, records, season comparisons, purple/orange cap, "
-                    "win rates, toss stats, or comparing same player across multiple seasons\n"
+                    "win rates, toss stats, or comparing same player across multiple seasons. ONLY use this for queries requiring database statistics.\n\n"
+                    "general_chat: greetings, app status, how the app works, or generic queries that do NOT need database/SQL statistics.\n"
                 )
             },
             {"role": "user", "content": question}
@@ -202,6 +272,7 @@ def route_question(question: str) -> dict:
 
 # ── SQL Generator ─────────────────────────────────────────────────────────────
 
+@timing
 def generate_sql(prompt: str) -> str:
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -215,6 +286,7 @@ def generate_sql(prompt: str) -> str:
 
 # ── Answer Generator ──────────────────────────────────────────────────────────
 
+@timing
 def generate_answer(question: str, tool: str, comparison_type: str, columns: list, rows: list) -> str:
     if not rows:
         return "No data found. Try rephrasing or check the player/team name."
@@ -242,11 +314,15 @@ Data:
 {results_text}
 
 Rules:
-- Be direct and factual
-- Never say "no wait", "actually", "hmm" or correct yourself mid-sentence
-- Lead with the answer in the first sentence
-- Under 80 words
-- Sound like ESPNCricinfo, not a chatbot"""
+- Always answer the user's question directly before discussing supporting statistics (lead with the answer in the first sentence).
+- Do not merely repeat rows from the SQL output.
+- Use the provided data to identify trends, strengths and weaknesses, performance patterns, comparisons, outliers, historical changes, or match situation insights.
+- Explain the cricketing significance of statistics rather than presenting numbers without context.
+- Base conclusions strictly on the provided query results. Never invent statistics, records, matches, seasons, players, events, or explanations not supported by the data.
+- If the data is insufficient to support a conclusion, explicitly say so.
+- Never say "no wait", "actually", "hmm" or correct yourself mid-sentence.
+- Keep the response concise (aim for under 100 words).
+- Sound like ESPNCricinfo, not a chatbot."""
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -260,27 +336,81 @@ Rules:
 # ── Main Entry Point ──────────────────────────────────────────────────────────
 
 def ask(question: str) -> dict:
+    start_time = time.time()
+    tool_name = None
+    args = None
     try:
         tool_call = route_question(question)
         tool_name = tool_call.function.name
         args      = json.loads(tool_call.function.arguments)
 
+        if tool_name == "general_chat":
+            prompt = GENERAL_CHAT_PROMPT.format(question=question)
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_completion_tokens=200,
+            )
+            answer = response.choices[0].message.content.strip()
+            duration = time.time() - start_time
+            write_log(f'[request] question="{question}" tool={tool_name} rows=0 total={duration:.1f}s')
+            return {
+                "question": question,
+                "tool":     tool_name,
+                "args":     args,
+                "sql":      None,
+                "answer":   answer,
+                "data":     {"columns": [], "rows": []}
+            }
+
         schema = get_schema()
 
         if tool_name == "player_stats":
+            player_name_raw = args.get("player_name")
+            player_name_san = sanitise(player_name_raw)
+            if not player_name_san:
+                duration = time.time() - start_time
+                write_log(f'[request] question="{question}" tool={tool_name} rows=0 total={duration:.1f}s')
+                return {
+                    "question": question,
+                    "tool":     tool_name,
+                    "args":     args,
+                    "sql":      None,
+                    "answer":   "Couldn't identify the player name. Please try again.",
+                    "data":     {"columns": [], "rows": []}
+                }
+            args["player_name"] = player_name_san
             prompt = PLAYER_STATS_PROMPT.format(
                 schema=schema,
-                player_name=args.get("player_name"),
+                player_name=player_name_san,
                 stat_type=args.get("stat_type"),
                 phase=args.get("phase", "overall"),
                 season=args.get("season") or "all seasons",
                 specific_stat=args.get("specific_stat") or "null"
             )
         elif tool_name == "player_comparison":
+            p1_raw = args.get("player1")
+            p2_raw = args.get("player2")
+            p1_san = sanitise(p1_raw)
+            p2_san = sanitise(p2_raw)
+            if not p1_san or not p2_san:
+                duration = time.time() - start_time
+                write_log(f'[request] question="{question}" tool={tool_name} rows=0 total={duration:.1f}s')
+                return {
+                    "question": question,
+                    "tool":     tool_name,
+                    "args":     args,
+                    "sql":      None,
+                    "answer":   "Both player names must be specified for a comparison. Please try again.",
+                    "data":     {"columns": [], "rows": []}
+                }
+            args["player1"] = p1_san
+            args["player2"] = p2_san
             prompt = PLAYER_COMPARISON_PROMPT.format(
                 schema=schema,
-                player1=args.get("player1"),
-                player2=args.get("player2"),
+                player1=p1_san,
+                player2=p2_san,
                 comparison_type=args.get("comparison_type"),
                 phase=args.get("phase", "overall")
             )
@@ -296,6 +426,8 @@ def ask(question: str) -> dict:
         comparison_type = args.get("comparison_type", "")
         answer = generate_answer(question, tool_name, comparison_type, columns, rows)
 
+        duration = time.time() - start_time
+        write_log(f'[request] question="{question}" tool={tool_name} rows={len(rows)} total={duration:.1f}s')
         return {
             "question": question,
             "tool":     tool_name,
@@ -305,12 +437,27 @@ def ask(question: str) -> dict:
             "data":     {"columns": columns, "rows": rows}
         }
 
-    except Exception as e:
+    except ValueError as e:
+        duration = time.time() - start_time
+        write_log(f'[request] question="{question}" tool={tool_name} rows=0 total={duration:.1f}s')
         return {
             "question": question,
-            "tool":     None,
-            "args":     None,
+            "tool":     tool_name,
+            "args":     args,
             "sql":      None,
-            "answer":   f"Sorry, I ran into an error: {str(e)}",
+            "answer":   f"Error: {str(e)}",
+            "data":     None
+        }
+    except Exception as e:
+        print(f"[error] {str(e)}")
+        write_log(f"[error] {str(e)}")
+        duration = time.time() - start_time
+        write_log(f'[request] question="{question}" tool={tool_name} rows=0 total={duration:.1f}s')
+        return {
+            "question": question,
+            "tool":     tool_name,
+            "args":     args,
+            "sql":      None,
+            "answer":   "An internal error occurred. Please try again later.",
             "data":     None
         }
