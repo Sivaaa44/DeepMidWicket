@@ -1,13 +1,13 @@
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from agent import ask
 from auth_routes import router as auth_router
 from auth import decode_token, oauth2_scheme
-from auth_database import log_token_usage
+from auth_database import log_token_usage, check_user_limit
 
 load_dotenv()
 
@@ -34,6 +34,10 @@ class QuestionRequest(BaseModel):
     question: str
 
 
+# In-memory store for anonymous IP usage
+anonymous_ip_usage = {}
+
+
 @app.get("/")
 def root():
     return {"status": "Cricket Intelligence Agent is running"}
@@ -45,14 +49,43 @@ def health():
 
 
 @app.post("/ask")
-def ask_question(request: QuestionRequest, token: str = Depends(oauth2_scheme)):
-    result = ask(request.question)
+def ask_question(question_request: QuestionRequest, request: Request, token: str = Depends(oauth2_scheme)):
+    user_id = None
+    user = None
 
     if token:
         try:
             user = decode_token(token)
             user_id = user["id"]
-            question = request.question
+        except Exception:
+            pass
+
+    if user_id:
+        # Check token limit for authenticated user
+        limit_info = check_user_limit(user_id)
+        if not limit_info["allowed"]:
+            raise HTTPException(
+                status_code=429,
+                detail="Monthly limit reached (50,000 tokens). Usage resets on the 1st."
+            )
+    else:
+        # Anonymous user: track by IP
+        client_ip = request.client.host if request.client else "unknown"
+        current_count = anonymous_ip_usage.get(client_ip, 0)
+        if current_count >= 5:
+            raise HTTPException(
+                status_code=429,
+                detail="Sign up for free to ask more questions."
+            )
+        anonymous_ip_usage[client_ip] = current_count + 1
+
+    # Execute ask
+    result = ask(question_request.question)
+
+    # If authenticated, log the tokens used
+    if user_id:
+        try:
+            question = question_request.question
             tool_used = result.get("tool") or "unknown"
             answer = result.get("answer") or ""
 

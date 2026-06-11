@@ -2,7 +2,8 @@ import re
 from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
 from auth import hash_password, verify_password, create_access_token, get_current_user
-from auth_database import create_user, get_user_by_email, get_user_by_username, get_user_stats
+from auth_database import create_user, get_user_by_email, get_user_by_username, get_user_stats, check_user_limit
+from datetime import date
 
 router = APIRouter()
 
@@ -93,9 +94,27 @@ def login(body: LoginRequest):
         }
     }
 
+def get_reset_date():
+    today = date.today()
+    if today.month == 12:
+        next_month = date(today.year + 1, 1, 1)
+    else:
+        next_month = date(today.year, today.month + 1, 1)
+    return next_month.strftime("%Y-%m-%d")
+
+def check_token_limit(current_user: dict = Depends(get_current_user)):
+    limit_info = check_user_limit(current_user["id"])
+    if not limit_info["allowed"]:
+        raise HTTPException(
+            status_code=429,
+            detail="Monthly limit reached (50,000 tokens). Usage resets on the 1st."
+        )
+    return current_user
+
 @router.get("/me")
 def get_me(current_user: dict = Depends(get_current_user)):
     stats = get_user_stats(current_user["id"])
+    limit_info = check_user_limit(current_user["id"])
     return {
         "id": current_user["id"],
         "email": current_user["email"],
@@ -103,5 +122,11 @@ def get_me(current_user: dict = Depends(get_current_user)):
         "stats": {
             "total_questions": stats["total_questions"],
             "total_tokens": stats["total_tokens"]
+        },
+        "usage": {
+            "used_this_month": limit_info["used"],
+            "limit": limit_info["limit"],
+            "remaining": limit_info["remaining"],
+            "reset_date": get_reset_date()
         }
     }

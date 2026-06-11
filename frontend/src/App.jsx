@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { askQuestion } from './api'
+import { askQuestion, getStoredToken, clearStoredToken, getMe } from './api'
 import Header from './components/Header'
 import InputBar from './components/InputBar'
 import LoadingDots from './components/LoadingDots'
 import ResultCard from './components/ResultCard'
 import UserQuestion from './components/UserQuestion'
+import AuthPage from './components/AuthPage'
+import StatsModal from './components/StatsModal'
 
 export default function App() {
+  const [token, setToken] = useState(getStoredToken())
+  const [user, setUser] = useState(null)
+  const [checkingAuth, setCheckingAuth] = useState(!!token)
+  const [statsOpen, setStatsOpen] = useState(false)
   const [results, setResults] = useState([])
   const [inputValue, setInputValue] = useState('')
   const [loading, setLoading] = useState(false)
@@ -15,9 +21,41 @@ export default function App() {
   const hasStarted = results.length > 0
 
   useEffect(() => {
+    const validateToken = async () => {
+      if (!token) {
+        setCheckingAuth(false)
+        return
+      }
+      try {
+        const userData = await getMe(token)
+        setUser(userData)
+      } catch (err) {
+        clearStoredToken()
+        setToken(null)
+        setUser(null)
+      } finally {
+        setCheckingAuth(false)
+      }
+    }
+    validateToken()
+  }, [token])
+
+  useEffect(() => {
     if (!hasStarted) return
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [results, loading, hasStarted])
+
+  const handleAuthSuccess = (newToken, newUser) => {
+    setToken(newToken)
+    setUser(newUser)
+  }
+
+  const handleLogout = () => {
+    clearStoredToken()
+    setToken(null)
+    setUser(null)
+    setResults([])
+  }
 
   const handleSubmit = useCallback(
     async (question) => {
@@ -30,7 +68,7 @@ export default function App() {
       setResults((prev) => [...prev, { id, loading: true, question: trimmed }])
 
       try {
-        const { data } = await askQuestion(trimmed)
+        const { data } = await askQuestion(trimmed, token)
         setResults((prev) =>
           prev.map((r) =>
             r.id === id
@@ -78,12 +116,29 @@ export default function App() {
         setLoading(false)
       }
     },
-    [loading],
+    [loading, token],
   )
+
+  if (checkingAuth) {
+    return (
+      <div className="flex h-dvh items-center justify-center bg-black text-muted-foreground text-sm">
+        Verifying session...
+      </div>
+    )
+  }
+
+  if (!user) {
+    return <AuthPage onSuccess={handleAuthSuccess} />
+  }
 
   return (
     <div className="flex h-dvh flex-col bg-black text-white">
-      <Header />
+      <Header
+        user={user}
+        onLogout={handleLogout}
+        onShowStats={() => setStatsOpen(true)}
+        onLoginClick={() => {}}
+      />
 
       {!hasStarted ? (
         <main className="flex flex-1 flex-col items-center justify-center overflow-hidden pt-14">
@@ -122,6 +177,8 @@ export default function App() {
           />
         </>
       )}
+
+      <StatsModal open={statsOpen} onOpenChange={setStatsOpen} />
     </div>
   )
 }

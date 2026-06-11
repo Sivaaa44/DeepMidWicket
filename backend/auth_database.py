@@ -17,7 +17,8 @@ def init_db():
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            is_active INTEGER DEFAULT 1
+            is_active INTEGER DEFAULT 1,
+            monthly_token_limit INTEGER DEFAULT 50000
         )
         """)
         conn.execute("""
@@ -33,6 +34,14 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
         """)
+        
+        # Schema migration to add monthly_token_limit if it doesn't exist
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "monthly_token_limit" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN monthly_token_limit INTEGER DEFAULT 50000")
+            
         conn.commit()
 
 # Run database initialisation
@@ -52,7 +61,8 @@ def create_user(email, username, password_hash):
                 "id": user_id,
                 "email": email,
                 "username": username,
-                "is_active": 1
+                "is_active": 1,
+                "monthly_token_limit": 50000
             }
         except sqlite3.IntegrityError as e:
             raise ValueError("Email or Username already exists.") from e
@@ -96,3 +106,33 @@ def get_user_stats(user_id):
             "total_questions": row["total_questions"] if row else 0,
             "total_tokens": row["total_tokens"] if row else 0
         }
+
+def get_user_monthly_usage(user_id):
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(total_tokens), 0) as monthly_usage
+            FROM token_usage
+            WHERE user_id = ? AND strftime('%Y-%m', timestamp) = strftime('%Y-%m', 'now')
+            """,
+            (user_id,)
+        ).fetchone()
+        return row["monthly_usage"] if row else 0
+
+def check_user_limit(user_id):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT monthly_token_limit FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+        limit = row["monthly_token_limit"] if row else 50000
+    
+    used = get_user_monthly_usage(user_id)
+    remaining = max(0, limit - used)
+    allowed = used < limit
+    return {
+        "allowed": allowed,
+        "used": used,
+        "limit": limit,
+        "remaining": remaining
+    }
