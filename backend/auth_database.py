@@ -30,6 +30,10 @@ def init_db():
             input_tokens INTEGER,
             output_tokens INTEGER,
             total_tokens INTEGER,
+            success INTEGER DEFAULT 1,
+            error_message TEXT,
+            latency_ms INTEGER,
+            ip_address TEXT,
             timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
@@ -41,6 +45,18 @@ def init_db():
         columns = [row[1] for row in cursor.fetchall()]
         if "monthly_token_limit" not in columns:
             conn.execute("ALTER TABLE users ADD COLUMN monthly_token_limit INTEGER DEFAULT 50000")
+            
+        # Schema migration to add new columns to token_usage if they don't exist
+        cursor.execute("PRAGMA table_info(token_usage)")
+        token_usage_cols = [row[1] for row in cursor.fetchall()]
+        if "success" not in token_usage_cols:
+            conn.execute("ALTER TABLE token_usage ADD COLUMN success INTEGER DEFAULT 1")
+        if "error_message" not in token_usage_cols:
+            conn.execute("ALTER TABLE token_usage ADD COLUMN error_message TEXT")
+        if "latency_ms" not in token_usage_cols:
+            conn.execute("ALTER TABLE token_usage ADD COLUMN latency_ms INTEGER")
+        if "ip_address" not in token_usage_cols:
+            conn.execute("ALTER TABLE token_usage ADD COLUMN ip_address TEXT")
             
         conn.commit()
 
@@ -77,16 +93,16 @@ def get_user_by_username(username):
         row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
         return dict(row) if row else None
 
-def log_token_usage(user_id, question, tool_used, input_tokens, output_tokens):
+def log_token_usage(user_id, question, tool_used, input_tokens, output_tokens, success=1, error_message=None, latency_ms=None, ip_address=None):
     total_tokens = input_tokens + output_tokens
     with get_connection() as conn:
         conn.execute(
             """
             INSERT INTO token_usage 
-            (user_id, question, tool_used, input_tokens, output_tokens, total_tokens) 
-            VALUES (?, ?, ?, ?, ?, ?)
+            (user_id, question, tool_used, input_tokens, output_tokens, total_tokens, success, error_message, latency_ms, ip_address) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, question, tool_used, input_tokens, output_tokens, total_tokens)
+            (user_id, question, tool_used, input_tokens, output_tokens, total_tokens, success, error_message, latency_ms, ip_address)
         )
         conn.commit()
 

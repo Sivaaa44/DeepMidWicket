@@ -241,7 +241,7 @@ Rules:
 # ── Router ────────────────────────────────────────────────────────────────────
 
 @timing
-def route_question(question: str) -> dict:
+def route_question(question: str):
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
@@ -267,13 +267,13 @@ def route_question(question: str) -> dict:
         tool_choice="required",
         temperature=0,
     )
-    return response.choices[0].message.tool_calls[0]
+    return response.choices[0].message.tool_calls[0], response.usage
 
 
 # ── SQL Generator ─────────────────────────────────────────────────────────────
 
 @timing
-def generate_sql(prompt: str) -> str:
+def generate_sql(prompt: str):
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
@@ -281,15 +281,16 @@ def generate_sql(prompt: str) -> str:
         max_completion_tokens=600,
     )
     sql = response.choices[0].message.content.strip()
-    return re.sub(r"```sql|```", "", sql).strip()
+    clean_sql = re.sub(r"```sql|```", "", sql).strip()
+    return clean_sql, response.usage
 
 
 # ── Answer Generator ──────────────────────────────────────────────────────────
 
 @timing
-def generate_answer(question: str, tool: str, comparison_type: str, columns: list, rows: list) -> str:
+def generate_answer(question: str, tool: str, comparison_type: str, columns: list, rows: list):
     if not rows:
-        return "No data found. Try rephrasing or check the player/team name."
+        return "No data found. Try rephrasing or check the player/team name.", None
 
     results_text = " | ".join(columns) + "\n" + "-" * 60 + "\n"
     for row in rows[:20]:
@@ -330,7 +331,7 @@ Rules:
         temperature=0.3,
         max_completion_tokens=200,
     )
-    return response.choices[0].message.content.strip()
+    return response.choices[0].message.content.strip(), response.usage
 
 
 # ── Main Entry Point ──────────────────────────────────────────────────────────
@@ -339,10 +340,17 @@ def ask(question: str) -> dict:
     start_time = time.time()
     tool_name = None
     args = None
+    total_input_tokens = 0
+    total_output_tokens = 0
+
     try:
-        tool_call = route_question(question)
+        tool_call, route_usage = route_question(question)
         tool_name = tool_call.function.name
         args      = json.loads(tool_call.function.arguments)
+
+        if route_usage:
+            total_input_tokens += getattr(route_usage, "prompt_tokens", 0)
+            total_output_tokens += getattr(route_usage, "completion_tokens", 0)
 
         if tool_name == "general_chat":
             prompt = GENERAL_CHAT_PROMPT.format(question=question)
@@ -352,6 +360,11 @@ def ask(question: str) -> dict:
                 temperature=0.3,
                 max_completion_tokens=200,
             )
+            chat_usage = response.usage
+            if chat_usage:
+                total_input_tokens += getattr(chat_usage, "prompt_tokens", 0)
+                total_output_tokens += getattr(chat_usage, "completion_tokens", 0)
+
             answer = response.choices[0].message.content.strip()
             duration = time.time() - start_time
             write_log(f'[request] question="{question}" tool={tool_name} rows=0 total={duration:.1f}s')
@@ -361,7 +374,12 @@ def ask(question: str) -> dict:
                 "args":     args,
                 "sql":      None,
                 "answer":   answer,
-                "data":     {"columns": [], "rows": []}
+                "data":     {"columns": [], "rows": []},
+                "tokens": {
+                    "input": total_input_tokens,
+                    "output": total_output_tokens,
+                    "total": total_input_tokens + total_output_tokens
+                }
             }
 
         schema = get_schema()
@@ -378,7 +396,12 @@ def ask(question: str) -> dict:
                     "args":     args,
                     "sql":      None,
                     "answer":   "Couldn't identify the player name. Please try again.",
-                    "data":     {"columns": [], "rows": []}
+                    "data":     {"columns": [], "rows": []},
+                    "tokens": {
+                        "input": total_input_tokens,
+                        "output": total_output_tokens,
+                        "total": total_input_tokens + total_output_tokens
+                    }
                 }
             args["player_name"] = player_name_san
             prompt = PLAYER_STATS_PROMPT.format(
@@ -403,7 +426,12 @@ def ask(question: str) -> dict:
                     "args":     args,
                     "sql":      None,
                     "answer":   "Both player names must be specified for a comparison. Please try again.",
-                    "data":     {"columns": [], "rows": []}
+                    "data":     {"columns": [], "rows": []},
+                    "tokens": {
+                        "input": total_input_tokens,
+                        "output": total_output_tokens,
+                        "total": total_input_tokens + total_output_tokens
+                    }
                 }
             args["player1"] = p1_san
             args["player2"] = p2_san
@@ -420,11 +448,18 @@ def ask(question: str) -> dict:
                 question=question
             )
 
-        sql = generate_sql(prompt)
+        sql, sql_usage = generate_sql(prompt)
+        if sql_usage:
+            total_input_tokens += getattr(sql_usage, "prompt_tokens", 0)
+            total_output_tokens += getattr(sql_usage, "completion_tokens", 0)
+
         columns, rows = run_query(sql)
 
         comparison_type = args.get("comparison_type", "")
-        answer = generate_answer(question, tool_name, comparison_type, columns, rows)
+        answer, ans_usage = generate_answer(question, tool_name, comparison_type, columns, rows)
+        if ans_usage:
+            total_input_tokens += getattr(ans_usage, "prompt_tokens", 0)
+            total_output_tokens += getattr(ans_usage, "completion_tokens", 0)
 
         duration = time.time() - start_time
         write_log(f'[request] question="{question}" tool={tool_name} rows={len(rows)} total={duration:.1f}s')
@@ -434,7 +469,12 @@ def ask(question: str) -> dict:
             "args":     args,
             "sql":      sql,
             "answer":   answer,
-            "data":     {"columns": columns, "rows": rows}
+            "data":     {"columns": columns, "rows": rows},
+            "tokens": {
+                "input": total_input_tokens,
+                "output": total_output_tokens,
+                "total": total_input_tokens + total_output_tokens
+            }
         }
 
     except ValueError as e:
@@ -446,7 +486,12 @@ def ask(question: str) -> dict:
             "args":     args,
             "sql":      None,
             "answer":   f"Error: {str(e)}",
-            "data":     None
+            "data":     None,
+            "tokens": {
+                "input": total_input_tokens,
+                "output": total_output_tokens,
+                "total": total_input_tokens + total_output_tokens
+            }
         }
     except Exception as e:
         print(f"[error] {str(e)}")
@@ -459,5 +504,10 @@ def ask(question: str) -> dict:
             "args":     args,
             "sql":      None,
             "answer":   "An internal error occurred. Please try again later.",
-            "data":     None
+            "data":     None,
+            "tokens": {
+                "input": total_input_tokens,
+                "output": total_output_tokens,
+                "total": total_input_tokens + total_output_tokens
+            }
         }
