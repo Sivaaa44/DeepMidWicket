@@ -31,3 +31,9 @@ export const askQuestion = (question, session_id, token) => {
   const headers = token ? { Authorization: `Bearer ${token}` } : {}
   return axios.post(`${BASE}/ask`, { question, session_id }, { headers })
 }
+
+export const getSessionMessages = async (session_id, token) => {
+  const headers = token ? { Authorization: `Bearer ${token}` } : {}
+  const { data } = await axios.get(`${BASE}/sessions/${session_id}/messages`, { headers })
+  return data
+}

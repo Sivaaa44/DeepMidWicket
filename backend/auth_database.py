@@ -193,7 +193,7 @@ def get_recent_messages(session_id: str, limit: int = 10):
             """
             SELECT role, content FROM messages 
             WHERE session_id = ? 
-            ORDER BY timestamp DESC LIMIT ?
+            ORDER BY timestamp DESC, id DESC LIMIT ?
             """,
             (session_id, limit)
         ).fetchall()

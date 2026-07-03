@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { askQuestion, getStoredToken, clearStoredToken, getMe } from './api'
+import { askQuestion, getStoredToken, clearStoredToken, getMe, getSessionMessages } from './api'
 import Header from './components/Header'
 import InputBar from './components/InputBar'
 import LoadingDots from './components/LoadingDots'
@@ -19,7 +19,8 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const bottomRef = useRef(null)
 
-  const { activeSessionId, startNewSession } = useSession()
+  const { activeSessionId, startNewSession, isExistingSession, setIsExistingSession } = useSession()
+  const [loadingHistory, setLoadingHistory] = useState(false)
 
   const handleNewChat = useCallback(() => {
     startNewSession()
@@ -47,6 +48,47 @@ export default function App() {
     }
     validateToken()
   }, [token])
+
+  useEffect(() => {
+    if (checkingAuth || !user || !activeSessionId || !isExistingSession) {
+      return
+    }
+
+    const loadHistory = async () => {
+      setLoadingHistory(true)
+      try {
+        const { messages } = await getSessionMessages(activeSessionId, token)
+        const reconstructed = []
+        for (let i = 0; i < messages.length; i++) {
+          const m = messages[i]
+          if (m.role === 'user') {
+            const assistantMsg = messages[i + 1]
+            reconstructed.push({
+              id: crypto.randomUUID(),
+              loading: false,
+              question: m.content,
+              tool: 'general_query',
+              args: {},
+              sql: '',
+              answer: assistantMsg ? assistantMsg.content : '',
+              data: { columns: [], rows: [] },
+              error: null
+            })
+            if (assistantMsg) {
+              i++
+            }
+          }
+        }
+        setResults(reconstructed)
+      } catch (err) {
+        console.error('Failed to load session history:', err)
+      } finally {
+        setLoadingHistory(false)
+        setIsExistingSession(false)
+      }
+    }
+    loadHistory()
+  }, [checkingAuth, user, activeSessionId, isExistingSession, token, setIsExistingSession])
 
   useEffect(() => {
     if (!hasStarted) return
@@ -137,6 +179,24 @@ export default function App() {
 
   if (!user) {
     return <AuthPage onSuccess={handleAuthSuccess} />
+  }
+
+  if (loadingHistory) {
+    return (
+      <div className="flex h-dvh flex-col bg-black text-white">
+        <Header
+          user={user}
+          onLogout={handleLogout}
+          onShowStats={() => setStatsOpen(true)}
+          onLoginClick={() => {}}
+          onNewChat={handleNewChat}
+        />
+        <div className="flex flex-1 flex-col items-center justify-center text-muted-foreground text-sm">
+          <LoadingDots />
+          <span className="mt-4">Restoring chat history...</span>
+        </div>
+      </div>
+    )
   }
 
   return (

@@ -12,6 +12,14 @@ export function useSession() {
     }
   })
 
+  const [isExistingSession, setIsExistingSession] = useState(() => {
+    try {
+      return !!localStorage.getItem(ACTIVE_SESSION_KEY)
+    } catch (e) {
+      return false
+    }
+  })
+
   // Automatically initialize session if none exists
   useEffect(() => {
     if (!activeSessionId) {
@@ -22,6 +30,7 @@ export function useSession() {
         console.error('Failed to save session_id to localStorage:', e)
       }
       setActiveSessionId(newId)
+      setIsExistingSession(false)
     }
   }, [activeSessionId])
 
@@ -33,11 +42,14 @@ export function useSession() {
       console.error('Failed to save session_id to localStorage:', e)
     }
     setActiveSessionId(newId)
+    setIsExistingSession(false)
     return newId
   }, [])
 
   return {
     activeSessionId,
     startNewSession,
+    isExistingSession,
+    setIsExistingSession,
   }
 }

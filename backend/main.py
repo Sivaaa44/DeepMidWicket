@@ -12,7 +12,7 @@ from agent import ask
 from auth_routes import router as auth_router
 from admin_routes import router as admin_router
 from auth import decode_token, oauth2_scheme
-from auth_database import log_token_usage, check_user_limit, save_message
+from auth_database import log_token_usage, check_user_limit, save_message, get_recent_messages, get_session_state
 
 load_dotenv()
 
@@ -55,6 +55,28 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/sessions/{session_id}/messages")
+def get_session_messages(session_id: str, token: str = Depends(oauth2_scheme)):
+    user_id = None
+    if token:
+        try:
+            user = decode_token(token)
+            user_id = user["id"]
+        except Exception:
+            pass
+
+    state = get_session_state(session_id)
+    if state and state.get("user_id") is not None:
+        if user_id != state.get("user_id"):
+            raise HTTPException(status_code=403, detail="Not authorized to access this session's messages")
+
+    try:
+        messages = get_recent_messages(session_id, limit=50)
+        return {"messages": messages}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ask")
