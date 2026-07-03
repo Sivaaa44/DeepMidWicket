@@ -5,6 +5,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -36,6 +37,26 @@ def init_db():
             ip_address TEXT,
             timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            ledger TEXT,
+            summary TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE
         )
         """)
         
@@ -152,3 +173,54 @@ def check_user_limit(user_id):
         "limit": limit,
         "remaining": remaining
     }
+
+def save_message(session_id: str, role: str, content: str):
+    with get_connection() as conn:
+        # Ensure the session exists first (with NULL user_id by default if not set yet)
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (session_id, user_id) VALUES (?, NULL)",
+            (session_id,)
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content)
+        )
+        conn.commit()
+
+def get_recent_messages(session_id: str, limit: int = 10):
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT role, content FROM messages 
+            WHERE session_id = ? 
+            ORDER BY timestamp DESC LIMIT ?
+            """,
+            (session_id, limit)
+        ).fetchall()
+        # Return chronological order (oldest first)
+        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+def save_session_state(session_id: str, user_id: int, ledger: str, summary: str):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO sessions (session_id, user_id, ledger, summary, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(session_id) DO UPDATE SET
+                user_id = COALESCE(excluded.user_id, sessions.user_id),
+                ledger = excluded.ledger,
+                summary = excluded.summary,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (session_id, user_id, ledger, summary)
+        )
+        conn.commit()
+
+def get_session_state(session_id: str):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT user_id, ledger, summary FROM sessions WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()
+        return dict(row) if row else None
+

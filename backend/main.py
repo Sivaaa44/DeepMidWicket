@@ -1,21 +1,24 @@
 import os
 import time
+import uuid
+from typing import Optional
 
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi import FastAPI, Depends, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from agent import ask
 from auth_routes import router as auth_router
 from admin_routes import router as admin_router
 from auth import decode_token, oauth2_scheme
-from auth_database import log_token_usage, check_user_limit
+from auth_database import log_token_usage, check_user_limit, save_message
 
 load_dotenv()
 
 app = FastAPI(title="Cricket Intelligence Agent")
 
-# Include Auth Router
+# Include Auth Routerx` `
 app.include_router(auth_router, prefix="/auth")
 
 # Include Admin Router
@@ -37,6 +40,7 @@ app.add_middleware(
 
 class QuestionRequest(BaseModel):
     question: str
+    session_id: Optional[str] = None
 
 
 # In-memory store for anonymous IP usage
@@ -54,7 +58,12 @@ def health():
 
 
 @app.post("/ask")
-def ask_question(question_request: QuestionRequest, request: Request, token: str = Depends(oauth2_scheme)):
+def ask_question(
+    question_request: QuestionRequest, 
+    request: Request, 
+    background_tasks: BackgroundTasks,
+    token: str = Depends(oauth2_scheme)
+):
     user_id = None
     user = None
     client_ip = request.client.host if request.client else "unknown"
@@ -84,14 +93,17 @@ def ask_question(question_request: QuestionRequest, request: Request, token: str
             )
         anonymous_ip_usage[client_ip] = current_count + 1
 
+    # Extract or generate session_id
+    session_id = question_request.session_id or str(uuid.uuid4())
+
     start_time = time.perf_counter()
     success = 1
     error_message = None
     result = None
 
     try:
-        # Execute ask
-        result = ask(question_request.question)
+        # Execute ask with session context parameters
+        result = ask(question_request.question, session_id=session_id, user_id=user_id)
         if result and (result.get("data") is None or "Error:" in str(result.get("answer", "")) or "An internal error occurred" in str(result.get("answer", ""))):
             success = 0
             error_message = result.get("answer") or "Unknown agent error"
@@ -109,6 +121,13 @@ def ask_question(question_request: QuestionRequest, request: Request, token: str
         }
 
     latency_ms = int((time.perf_counter() - start_time) * 1000)
+
+    # Queue async write-through to SQLite
+    background_tasks.add_task(save_message, session_id, "user", question_request.question)
+    background_tasks.add_task(save_message, session_id, "assistant", result.get("answer", ""))
+
+    # Inject session_id into response
+    result["session_id"] = session_id
 
     # Log token usage (for both authenticated and anonymous requests)
     try:

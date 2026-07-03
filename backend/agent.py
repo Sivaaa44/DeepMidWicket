@@ -2,10 +2,41 @@ import os
 import re
 import json
 import time
+import threading
 from functools import wraps
+# pyrefly: ignore [missing-import]
 from groq import Groq
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
+# pyrefly: ignore [missing-import]
+import redis
 from database import run_query, get_schema
+from auth_database import save_message, get_recent_messages, save_session_state, get_session_state
+
+# Setup Redis Client
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_DB = int(os.getenv("REDIS_DB", 0))
+
+redis_client = None
+use_redis = False
+
+# We will initialize this at runtime or here.
+try:
+    redis_client = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        decode_responses=True,
+        socket_timeout=1.0  # Fail fast if Redis is offline
+    )
+    redis_client.ping()
+    use_redis = True
+    print("[redis] Connected successfully to Redis.")
+except Exception as e:
+    print(f"[redis] Connection failed: {e}. Falling back to SQLite.")
+    use_redis = False
+
 
 # Setup logging
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -46,6 +77,464 @@ def sanitise(value) -> str:
         val = val.replace(char, '')
     return val
 
+# ── Context Management & Session Helpers ─────────────────────────────────────
+
+KNOWN_PEOPLE = set()
+KNOWN_ORGANIZATIONS = set()
+KNOWN_PLACES = set()
+
+def load_known_entities():
+    global KNOWN_PEOPLE, KNOWN_ORGANIZATIONS, KNOWN_PLACES
+    try:
+        import sqlite3
+        db_file = os.path.join(os.path.dirname(__file__), "cricket.db")
+        if os.path.exists(db_file):
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            
+            # Fetch teams (organizations)
+            cursor.execute("SELECT DISTINCT team1 FROM matches UNION SELECT DISTINCT team2 FROM matches")
+            teams = {row[0].strip() for row in cursor.fetchall() if row[0]}
+            
+            # Fetch batters and bowlers (people)
+            cursor.execute("SELECT DISTINCT batter FROM deliveries UNION SELECT DISTINCT bowler FROM deliveries")
+            players = {row[0].strip() for row in cursor.fetchall() if row[0]}
+            
+            # Fetch player of the match (people)
+            cursor.execute("SELECT DISTINCT player_of_match FROM matches")
+            pom = {row[0].strip() for row in cursor.fetchall() if row[0]}
+            
+            # Fetch venues and cities (places)
+            cursor.execute("SELECT DISTINCT venue FROM matches UNION SELECT DISTINCT city FROM matches")
+            places = {row[0].strip() for row in cursor.fetchall() if row[0]}
+            
+            conn.close()
+            
+            KNOWN_PEOPLE = players.union(pom)
+            KNOWN_ORGANIZATIONS = teams
+            KNOWN_PLACES = places
+            
+            print(f"[entities] Loaded {len(KNOWN_PEOPLE)} people, {len(KNOWN_ORGANIZATIONS)} organizations, and {len(KNOWN_PLACES)} places.")
+    except Exception as e:
+        print(f"[entities] Failed to load known entities: {e}")
+
+load_known_entities()
+
+def extract_entities_rule_based(text: str) -> dict:
+    text_lower = text.lower()
+    
+    # Helper to parse words and track their original capitalization (useful to identify proper nouns)
+    def parse_query_words(txt: str):
+        words_list = []
+        caps_list = []
+        # Find all words (alphanumeric sequences)
+        for match in re.finditer(r'\b\w+\b', txt):
+            word = match.group()
+            # Ignore single letter 's' which is usually possessive suffix from "Kohli's"
+            if word.lower() == 's':
+                continue
+            words_list.append(word.lower())
+            caps_list.append(word[0].isupper())
+        return words_list, caps_list
+
+    def match_category(entity_set, threshold):
+        q_words, q_caps = parse_query_words(text)
+        candidates = []
+        
+        for entity in entity_set:
+            entity_lower = entity.lower()
+            entity_tokens = entity_lower.split()
+            
+            # Significant tokens
+            sig_tokens = [t for t in entity_tokens if len(t) > threshold]
+            if not sig_tokens:
+                sig_tokens = [entity_lower]
+                
+            score = len(sig_tokens)
+            
+            # 1. Fast exact check with word boundaries
+            if re.search(r'\b' + re.escape(entity_lower) + r'\b', text_lower):
+                candidates.append((entity, score))
+                continue
+                
+            # 2. Token match check
+            # Require all significant tokens to be present in the query words
+            if not all(t in q_words for t in sig_tokens):
+                continue
+                
+            # Check other tokens (initials or skipped words) for contradiction
+            contradiction = False
+            for t in sig_tokens:
+                # Find all occurrences of t in query words
+                q_indices = [idx for idx, qw in enumerate(q_words) if qw == t]
+                for q_idx in q_indices:
+                    # Find index of t in entity tokens
+                    try:
+                        e_idx = entity_tokens.index(t)
+                    except ValueError:
+                        continue
+                        
+                    # Validate all other tokens in the entity relative to this matched token
+                    for other_idx, other_token in enumerate(entity_tokens):
+                        if other_idx == e_idx:
+                            continue
+                        offset = other_idx - e_idx
+                        target_q_idx = q_idx + offset
+                        
+                        if 0 <= target_q_idx < len(q_words):
+                            # Only treat as contradiction if the query word is a capitalized proper noun
+                            if q_caps[target_q_idx]:
+                                q_word = q_words[target_q_idx]
+                                if len(other_token) == 1:  # Initial (e.g. 'v', 't')
+                                    if not q_word.startswith(other_token):
+                                        contradiction = True
+                                        break
+                                else:  # Full word
+                                    if q_word != other_token:
+                                        contradiction = True
+                                        break
+                    if contradiction:
+                        break
+                if contradiction:
+                    break
+                    
+            if not contradiction:
+                candidates.append((entity, score))
+                
+        if not candidates:
+            return []
+            
+        max_score = max(score for _, score in candidates)
+        # Keep candidates with the highest token score (longest matches)
+        return [entity for entity, score in candidates if score == max_score]
+
+    entities = {
+        "people": match_category(KNOWN_PEOPLE, 2),
+        "organizations": match_category(KNOWN_ORGANIZATIONS, 3),
+        "places": match_category(KNOWN_PLACES, 4),
+        "dates": [],
+        "identifiers": []
+    }
+    
+    # Match dates (years from 2008 to 2026, or YYYY-MM-DD format)
+    years = re.findall(r'\b(200\d|201\d|202\d)\b', text)
+    for y in years:
+        entities["dates"].append(y)
+    dates_found = re.findall(r'\b\d{4}-\d{2}-\d{2}\b', text)
+    for d in dates_found:
+        entities["dates"].append(d)
+
+    # Match identifiers (e.g. 5-7 digit match IDs)
+    ids = re.findall(r'\b(\d{5,7})\b', text)
+    for i in ids:
+        if i not in entities["dates"]:
+            entities["identifiers"].append(i)
+
+    # Deduplicate
+    entities["dates"] = list(set(entities["dates"]))
+    entities["identifiers"] = list(set(entities["identifiers"]))
+    
+    return entities
+
+def get_session_context(session_id: str):
+    if not session_id:
+        return {
+            "people": [],
+            "organizations": [],
+            "dates": [],
+            "places": [],
+            "identifiers": []
+        }, "", []
+
+    ledger = {
+        "people": [],
+        "organizations": [],
+        "dates": [],
+        "places": [],
+        "identifiers": []
+    }
+    summary = ""
+    hot_window = []
+    cache_hit = False
+
+    if use_redis:
+        try:
+            ledger_str = redis_client.get(f"session:{session_id}:ledger")
+            summary_val = redis_client.get(f"session:{session_id}:summary")
+            hot_window_strs = redis_client.lrange(f"session:{session_id}:hot_window", 0, -1)
+
+            if ledger_str is not None or summary_val is not None or hot_window_strs:
+                cache_hit = True
+                if ledger_str:
+                    try:
+                        ledger_loaded = json.loads(ledger_str)
+                        if isinstance(ledger_loaded, dict):
+                            ledger = ledger_loaded
+                    except Exception:
+                        pass
+                if summary_val:
+                    summary = summary_val
+                if hot_window_strs:
+                    hot_window = [json.loads(m) for m in hot_window_strs]
+        except Exception as e:
+            write_log(f"[redis] Error reading context: {e}")
+
+    if not cache_hit:
+        # Load from SQLite
+        state = get_session_state(session_id)
+        if state:
+            ledger_raw = state.get("ledger")
+            if ledger_raw:
+                try:
+                    ledger_loaded = json.loads(ledger_raw)
+                    if isinstance(ledger_loaded, dict):
+                        ledger = ledger_loaded
+                except Exception:
+                    pass
+            summary = state.get("summary") or ""
+        else:
+            summary = ""
+
+        # Fetch last 10 messages (chronological order)
+        hot_window = get_recent_messages(session_id, limit=10)
+
+        # Warm up Redis
+        if use_redis:
+            try:
+                redis_client.set(f"session:{session_id}:ledger", json.dumps(ledger), ex=7200)
+                redis_client.set(f"session:{session_id}:summary", summary, ex=7200)
+                if hot_window:
+                    redis_client.delete(f"session:{session_id}:hot_window")
+                    redis_client.rpush(f"session:{session_id}:hot_window", *[json.dumps(m) for m in hot_window])
+                    redis_client.expire(f"session:{session_id}:hot_window", 7200)
+            except Exception as e:
+                write_log(f"[redis] Error warming cache: {e}")
+
+    # Ensure ledger is structured dict even if it was parsed as a list in database/cache due to legacy runs
+    if not isinstance(ledger, dict):
+        ledger = {
+            "people": [],
+            "organizations": [],
+            "dates": [],
+            "places": [],
+            "identifiers": []
+        }
+
+    return ledger, summary, hot_window
+
+def save_chat_turn_to_redis(session_id: str, user_msg: str, assistant_msg: str):
+    if not use_redis or not session_id:
+        return
+    try:
+        user_turn = {"role": "user", "content": user_msg}
+        ast_turn = {"role": "assistant", "content": assistant_msg}
+        
+        # Append to Redis list
+        redis_client.rpush(f"session:{session_id}:hot_window", json.dumps(user_turn), json.dumps(ast_turn))
+        
+        # Enforce sliding expiry (2 hours = 7200s)
+        redis_client.expire(f"session:{session_id}:hot_window", 7200)
+        redis_client.expire(f"session:{session_id}:ledger", 7200)
+        redis_client.expire(f"session:{session_id}:summary", 7200)
+        
+        # Check window size and pop oldest 2 turns if size > 10
+        length = redis_client.llen(f"session:{session_id}:hot_window")
+        if length > 10:
+            msg1_str = redis_client.lpop(f"session:{session_id}:hot_window")
+            msg2_str = redis_client.lpop(f"session:{session_id}:hot_window")
+            
+            if msg1_str and msg2_str:
+                redis_client.rpush(f"session:{session_id}:pending_summarization", msg1_str, msg2_str)
+                redis_client.expire(f"session:{session_id}:pending_summarization", 7200)
+    except Exception as e:
+        write_log(f"[redis] Error saving turn to cache: {e}")
+
+def extract_entities_llm(question: str, history: str = None) -> dict:
+    prompt = f"""You are an assistant that extracts structured cricket entities (player names, team names, match details) from text.
+Analyze the user question and the optional history context. Identify any entities and group them into these categories:
+- people: player names, umpire names, person references (e.g. "V Kohli", "RG Sharma")
+- organizations: IPL team names or abbreviations (e.g. "Mumbai Indians", "RCB")
+- dates: seasons, match dates, years (e.g. "2024", "2008")
+- places: venue cities or stadium names (e.g. "Wankhede Stadium", "Mumbai")
+- identifiers: match IDs or specific numbers (e.g. "335982")
+
+User Question: "{question}"
+History Context: {history or "None"}
+
+Return a JSON object in exactly this format:
+{{
+  "people": [],
+  "organizations": [],
+  "dates": [],
+  "places": [],
+  "identifiers": []
+}}
+
+Output ONLY valid JSON:"""
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={"type": "json_object"}
+        )
+        data = json.loads(response.choices[0].message.content.strip())
+        return {
+            "people": data.get("people", []) or [],
+            "organizations": data.get("organizations", []) or [],
+            "dates": data.get("dates", []) or [],
+            "places": data.get("places", []) or [],
+            "identifiers": data.get("identifiers", []) or []
+        }
+    except Exception as e:
+        write_log(f"[ledger] LLM extraction error: {e}")
+        return {
+            "people": [],
+            "organizations": [],
+            "dates": [],
+            "places": [],
+            "identifiers": []
+        }
+
+def update_ledger(session_id: str, user_id: int, question: str, old_ledger: dict, history_str: str) -> dict:
+    matched = extract_entities_rule_based(question)
+    
+    # Check if rule-based found any entity
+    has_any = any(len(val) > 0 for val in matched.values())
+    
+    if not has_any:
+        reference_words = ["he", "him", "his", "they", "them", "their", "it", "this", "that", "compare", "player", "team", "venue", "stadium", "year", "season", "match"]
+        has_reference = any(w in question.lower().split() for w in reference_words)
+        if has_reference:
+            matched = extract_entities_llm(question, history_str)
+            
+    # Merge matched entities into new_ledger
+    new_ledger = {}
+    for key in ["people", "organizations", "dates", "places", "identifiers"]:
+        old_list = old_ledger.get(key, []) if isinstance(old_ledger, dict) else []
+        matched_list = matched.get(key, [])
+        combined = list(set(old_list + matched_list))
+        # Keep only the last 5 entities per category to prevent bloat
+        new_ledger[key] = combined[-5:]
+    
+    if session_id:
+        if use_redis:
+            try:
+                redis_client.set(f"session:{session_id}:ledger", json.dumps(new_ledger), ex=7200)
+            except Exception as e:
+                write_log(f"[redis] Error saving ledger: {e}")
+        
+        # Sync to SQLite
+        summary = ""
+        if use_redis:
+            try:
+                summary = redis_client.get(f"session:{session_id}:summary") or ""
+            except Exception:
+                pass
+        try:
+            save_session_state(session_id, user_id, json.dumps(new_ledger), summary)
+        except Exception as e:
+            write_log(f"[sqlite] Error saving session state: {e}")
+            
+    return new_ledger
+
+def summarize_session_history(session_id: str, user_id: int):
+    if not session_id:
+        return
+    try:
+        old_summary = ""
+        pending_strs = []
+        
+        if use_redis:
+            old_summary = redis_client.get(f"session:{session_id}:summary") or ""
+            pending_strs = redis_client.lrange(f"session:{session_id}:pending_summarization", 0, -1)
+        
+        if not pending_strs:
+            return
+            
+        pending_messages = [json.loads(m) for m in pending_strs]
+        
+        formatted_messages = []
+        for m in pending_messages:
+            role = "User" if m["role"] == "user" else "Assistant"
+            formatted_messages.append(f"{role}: {m['content']}")
+        pending_text = "\n".join(formatted_messages)
+        
+        prompt = f"""You are an assistant summarizing a chat conversation about cricket statistics.
+Condense the following new messages into a single prose summary, integrating it with the existing summary if provided.
+
+Existing Summary:
+"{old_summary}"
+
+New Messages to summarize:
+{pending_text}
+
+Provide a concise updated summary in prose under 100 words summarizing the main players, teams, and stats discussed. Do not use JSON or bullet points. Just prose.
+
+Updated Summary:"""
+        
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_completion_tokens=200,
+        )
+        new_summary = response.choices[0].message.content.strip()
+        
+        if use_redis:
+            redis_client.set(f"session:{session_id}:summary", new_summary, ex=7200)
+            redis_client.delete(f"session:{session_id}:pending_summarization")
+            
+            ledger_str = redis_client.get(f"session:{session_id}:ledger")
+            try:
+                ledger = json.loads(ledger_str) if ledger_str else {}
+            except Exception:
+                ledger = {}
+        else:
+            ledger = {}
+            
+        save_session_state(session_id, user_id, json.dumps(ledger), new_summary)
+        write_log(f"[summarization] Updated summary for session {session_id}.")
+    except Exception as e:
+        write_log(f"[summarization] Error during background summarization: {e}")
+
+def run_summarization_thread(session_id: str, user_id: int):
+    t = threading.Thread(target=summarize_session_history, args=(session_id, user_id))
+    t.daemon = True
+    t.start()
+
+def check_and_trigger_summarization(session_id: str, user_id: int):
+    if not use_redis or not session_id:
+        return
+    try:
+        pending_len = redis_client.llen(f"session:{session_id}:pending_summarization")
+        if pending_len >= 6:
+            write_log(f"[summarization] Triggering summary for session {session_id} (pending size: {pending_len})")
+            run_summarization_thread(session_id, user_id)
+    except Exception as e:
+        write_log(f"[redis] Error checking summarization queue: {e}")
+
+def format_context_str(ledger: dict, summary: str, hot_window: list) -> str:
+    parts = []
+    if ledger and isinstance(ledger, dict):
+        ledger_lines = []
+        for category, items in ledger.items():
+            if items:
+                ledger_lines.append(f"- {category.capitalize()}: {', '.join(items)}")
+        if ledger_lines:
+            parts.append("=== SESSION CONTEXT (ENTITY LEDGER) ===\n" + "\n".join(ledger_lines))
+    if summary:
+        parts.append(f"=== CONVERSATION SUMMARY ===\n{summary}")
+    if hot_window:
+        history_lines = []
+        for msg in hot_window:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_lines.append(f"{role}: {msg['content']}")
+        parts.append("=== RECENT DIALOGUE (HOT WINDOW) ===\n" + "\n".join(history_lines))
+    
+    return "\n\n".join(parts) if parts else ""
+
+
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
@@ -64,8 +553,8 @@ TOOLS = [
                     "player_name":  {"type": "string", "description": "Player name keyword e.g. 'Kohli', 'Bumrah'"},
                     "stat_type":    {"type": "string", "enum": ["batting", "bowling", "allround"]},
                     "phase":        {"type": "string", "enum": ["overall", "powerplay", "middle", "death"]},
-                    "season":       {"type": "string", "description": "e.g. '2024' or null for all seasons"},
-                    "specific_stat": {"type": "string", "description": "If user asks for just one stat e.g. 'wickets', 'runs', 'economy', 'strike rate'. Null if full profile asked."}
+                    "season":       {"type": "string", "description": "Optional. Specify the season year e.g. '2024'. Omit this property if not filtered by a specific season."},
+                    "specific_stat": {"type": "string", "description": "Optional. If user asks for just one specific statistic (e.g. 'wickets', 'runs', 'economy', 'strike rate'). Omit this property if a full profile/statistics are requested."}
                 },
                 "required": ["player_name", "stat_type", "phase"]
             }
@@ -241,25 +730,29 @@ Rules:
 # ── Router ────────────────────────────────────────────────────────────────────
 
 @timing
-def route_question(question: str):
+def route_question(question: str, context_str: str = None):
+    system_content = (
+        "You are a cricket analytics router. Pick the right tool.\n\n"
+        "player_stats: one named player, asking about their performance stats\n"
+        "  - Set specific_stat if user asks for just one thing e.g. 'wickets', 'runs', 'economy'\n"
+        "  - Set specific_stat=null if user wants full stats or a profile\n\n"
+        "player_comparison: two players being compared OR head-to-head matchup\n"
+        "  - batter_vs_batter: two batters\n"
+        "  - bowler_vs_bowler: two bowlers\n"
+        "  - batter_vs_bowler: one batter one bowler, head to head\n\n"
+        "general_query: teams, venues, records, season comparisons, purple/orange cap, "
+        "win rates, toss stats, or comparing same player across multiple seasons. ONLY use this for queries requiring database statistics.\n\n"
+        "general_chat: greetings, app status, how the app works, or generic queries that do NOT need database/SQL statistics.\n"
+    )
+    if context_str:
+        system_content = f"{context_str}\n\nUse the session context above to resolve pronouns and identify implicit entities in the user question.\n\n{system_content}"
+
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "You are a cricket analytics router. Pick the right tool.\n\n"
-                    "player_stats: one named player, asking about their performance stats\n"
-                    "  - Set specific_stat if user asks for just one thing e.g. 'wickets', 'runs', 'economy'\n"
-                    "  - Set specific_stat=null if user wants full stats or a profile\n\n"
-                    "player_comparison: two players being compared OR head-to-head matchup\n"
-                    "  - batter_vs_batter: two batters\n"
-                    "  - bowler_vs_bowler: two bowlers\n"
-                    "  - batter_vs_bowler: one batter one bowler, head to head\n\n"
-                    "general_query: teams, venues, records, season comparisons, purple/orange cap, "
-                    "win rates, toss stats, or comparing same player across multiple seasons. ONLY use this for queries requiring database statistics.\n\n"
-                    "general_chat: greetings, app status, how the app works, or generic queries that do NOT need database/SQL statistics.\n"
-                )
+                "content": system_content
             },
             {"role": "user", "content": question}
         ],
@@ -288,7 +781,7 @@ def generate_sql(prompt: str):
 # ── Answer Generator ──────────────────────────────────────────────────────────
 
 @timing
-def generate_answer(question: str, tool: str, comparison_type: str, columns: list, rows: list):
+def generate_answer(question: str, tool: str, comparison_type: str, columns: list, rows: list, context_str: str = None):
     if not rows:
         return "No data found. Try rephrasing or check the player/team name.", None
 
@@ -306,9 +799,11 @@ def generate_answer(question: str, tool: str, comparison_type: str, columns: lis
         "general_query": "Answer directly. Lead with the key stat or finding."
     }.get(tool, "Answer clearly.")
 
+    context_prefix = f"{context_str}\n\n" if context_str else ""
+
     prompt = f"""You are a cricket analyst giving factual IPL insights.
 
-User asked: "{question}"
+{context_prefix}User asked: "{question}"
 {context}
 
 Data:
@@ -336,7 +831,7 @@ Rules:
 
 # ── Main Entry Point ──────────────────────────────────────────────────────────
 
-def ask(question: str) -> dict:
+def ask(question: str, session_id: str = None, user_id: int = None) -> dict:
     start_time = time.time()
     tool_name = None
     args = None
@@ -344,7 +839,12 @@ def ask(question: str) -> dict:
     total_output_tokens = 0
 
     try:
-        tool_call, route_usage = route_question(question)
+        # Load session context
+        ledger, summary, hot_window = get_session_context(session_id)
+        context_str = format_context_str(ledger, summary, hot_window)
+
+        # Route the question with context
+        tool_call, route_usage = route_question(question, context_str)
         tool_name = tool_call.function.name
         args      = json.loads(tool_call.function.arguments)
 
@@ -353,7 +853,22 @@ def ask(question: str) -> dict:
             total_output_tokens += getattr(route_usage, "completion_tokens", 0)
 
         if tool_name == "general_chat":
-            prompt = GENERAL_CHAT_PROMPT.format(question=question)
+            if context_str:
+                prompt = f"""You are a helpful cricket intelligence assistant.
+Answer the user's question directly and concisely.
+
+{context_str}
+
+User asked: "{question}"
+
+Rules:
+- Be helpful, conversational, and direct.
+- Do not mention or generate SQL queries.
+- If the user asks about the app, explain that this is a Cricket Intelligence App that allows querying IPL statistics, comparing players, and checking match records.
+- Keep it under 100 words."""
+            else:
+                prompt = GENERAL_CHAT_PROMPT.format(question=question)
+
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
@@ -366,6 +881,13 @@ def ask(question: str) -> dict:
                 total_output_tokens += getattr(chat_usage, "completion_tokens", 0)
 
             answer = response.choices[0].message.content.strip()
+
+            # Save turn to cache and update state
+            if session_id:
+                save_chat_turn_to_redis(session_id, question, answer)
+                ledger = update_ledger(session_id, user_id, question, ledger, context_str)
+                check_and_trigger_summarization(session_id, user_id)
+
             duration = time.time() - start_time
             write_log(f'[request] question="{question}" tool={tool_name} rows=0 total={duration:.1f}s')
             return {
@@ -456,10 +978,16 @@ def ask(question: str) -> dict:
         columns, rows = run_query(sql)
 
         comparison_type = args.get("comparison_type", "")
-        answer, ans_usage = generate_answer(question, tool_name, comparison_type, columns, rows)
+        answer, ans_usage = generate_answer(question, tool_name, comparison_type, columns, rows, context_str)
         if ans_usage:
             total_input_tokens += getattr(ans_usage, "prompt_tokens", 0)
             total_output_tokens += getattr(ans_usage, "completion_tokens", 0)
+
+        # Save turn to cache and update state
+        if session_id:
+            save_chat_turn_to_redis(session_id, question, answer)
+            ledger = update_ledger(session_id, user_id, question, ledger, context_str)
+            check_and_trigger_summarization(session_id, user_id)
 
         duration = time.time() - start_time
         write_log(f'[request] question="{question}" tool={tool_name} rows={len(rows)} total={duration:.1f}s')
