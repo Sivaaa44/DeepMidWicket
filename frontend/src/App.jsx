@@ -7,6 +7,7 @@ import ResultCard from './components/ResultCard'
 import UserQuestion from './components/UserQuestion'
 import AuthPage from './components/AuthPage'
 import StatsModal from './components/StatsModal'
+import { useSession } from './lib/useSession'
 
 export default function App() {
   const [token, setToken] = useState(getStoredToken())
@@ -17,6 +18,13 @@ export default function App() {
   const [inputValue, setInputValue] = useState('')
   const [loading, setLoading] = useState(false)
   const bottomRef = useRef(null)
+
+  const { activeSessionId, startNewSession } = useSession()
+
+  const handleNewChat = useCallback(() => {
+    startNewSession()
+    setResults([])
+  }, [startNewSession])
 
   const hasStarted = results.length > 0
 
@@ -68,7 +76,7 @@ export default function App() {
       setResults((prev) => [...prev, { id, loading: true, question: trimmed }])
 
       try {
-        const { data } = await askQuestion(trimmed, token)
+        const { data } = await askQuestion(trimmed, activeSessionId, token)
         setResults((prev) =>
           prev.map((r) =>
             r.id === id
@@ -116,7 +124,7 @@ export default function App() {
         setLoading(false)
       }
     },
-    [loading, token],
+    [loading, token, activeSessionId],
   )
 
   if (checkingAuth) {
@@ -138,6 +146,7 @@ export default function App() {
         onLogout={handleLogout}
         onShowStats={() => setStatsOpen(true)}
         onLoginClick={() => {}}
+        onNewChat={handleNewChat}
       />
 
       {!hasStarted ? (

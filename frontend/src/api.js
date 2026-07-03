@@ -27,7 +27,7 @@ export const getMe = async (token) => {
   return data
 }
 
-export const askQuestion = (question, token) => {
+export const askQuestion = (question, session_id, token) => {
   const headers = token ? { Authorization: `Bearer ${token}` } : {}
-  return axios.post(`${BASE}/ask`, { question }, { headers })
+  return axios.post(`${BASE}/ask`, { question, session_id }, { headers })
 }
