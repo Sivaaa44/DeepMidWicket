@@ -14,22 +14,26 @@ from database import run_query, get_schema
 from auth_database import save_message, get_recent_messages, save_session_state, get_session_state
 
 # Setup Redis Client
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-REDIS_DB = int(os.getenv("REDIS_DB", 0))
+REDIS_URL = os.getenv("REDIS_URL")
 
 redis_client = None
 use_redis = False
 
-# We will initialize this at runtime or here.
 try:
-    redis_client = redis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        decode_responses=True,
-        socket_timeout=1.0  # Fail fast if Redis is offline
-    )
+    if REDIS_URL:
+        redis_client = redis.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_timeout=1.0  # Fail fast if Redis is offline
+        )
+    else:
+        redis_client = redis.Redis(
+            host=os.getenv("REDIS_HOST", "localhost"),
+            port=int(os.getenv("REDIS_PORT", 6379)),
+            db=int(os.getenv("REDIS_DB", 0)),
+            decode_responses=True,
+            socket_timeout=1.0  # Fail fast if Redis is offline
+        )
     redis_client.ping()
     use_redis = True
     print("[redis] Connected successfully to Redis.")
