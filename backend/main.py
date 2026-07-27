@@ -249,7 +249,18 @@ def ask_question(
 
     # Queue async write-through to SQLite
     background_tasks.add_task(save_message, session_id, "user", question_request.question, user_id, client_ip)
-    background_tasks.add_task(save_message, session_id, "assistant", result.get("answer", ""), user_id, client_ip)
+    background_tasks.add_task(
+        save_message, 
+        session_id, 
+        "assistant", 
+        result.get("answer", ""), 
+        user_id, 
+        client_ip,
+        tool=result.get("tool"),
+        args=result.get("args"),
+        sql=result.get("sql"),
+        data=result.get("data")
+    )
 
     # Inject session_id into response
     result["session_id"] = session_id

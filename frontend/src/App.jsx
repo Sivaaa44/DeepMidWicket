@@ -44,11 +44,11 @@ export default function App() {
             id: crypto.randomUUID(),
             loading: false,
             question: m.content,
-            tool: 'general_query',
-            args: {},
-            sql: '',
+            tool: assistantMsg?.tool ?? 'general_query',
+            args: assistantMsg?.args ?? {},
+            sql: assistantMsg?.sql ?? '',
             answer: assistantMsg ? assistantMsg.content : '',
-            data: { columns: [], rows: [] },
+            data: assistantMsg?.data ?? { columns: [], rows: [] },
             error: null
           })
           if (assistantMsg) {

@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import json
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
 
@@ -59,6 +60,20 @@ def init_db():
             FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE
         )
         """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            tool TEXT,
+            args TEXT,
+            sql_query TEXT,
+            result_columns TEXT,
+            result_rows TEXT,
+            row_count INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (message_id) REFERENCES messages (id) ON DELETE CASCADE
+        )
+        """)
         
         # Schema migration to add monthly_token_limit if it doesn't exist
         cursor = conn.cursor()
@@ -83,6 +98,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_anon_ip ON sessions(anon_ip)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_message ON message_artifacts(message_id)")
             
         conn.commit()
 
@@ -179,7 +195,17 @@ def check_user_limit(user_id):
         "remaining": remaining
     }
 
-def save_message(session_id: str, role: str, content: str, user_id=None, anon_ip=None):
+def save_message(
+    session_id: str, 
+    role: str, 
+    content: str, 
+    user_id=None, 
+    anon_ip=None, 
+    tool: str = None, 
+    args: dict = None, 
+    sql: str = None, 
+    data: dict = None
+):
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT session_id, title, user_id, anon_ip FROM sessions WHERE session_id = ?", (session_id,))
@@ -224,20 +250,83 @@ def save_message(session_id: str, role: str, content: str, user_id=None, anon_ip
             "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
             (session_id, role, content)
         )
+        msg_id = cursor.lastrowid
+
+        # Save artifact if tool, sql, or data exists for assistant response
+        if role == "assistant" and (tool or sql or (data and isinstance(data, dict))):
+            cols = data.get("columns", []) if (data and isinstance(data, dict)) else []
+            rows = data.get("rows", []) if (data and isinstance(data, dict)) else []
+            capped_rows = rows[:100] if rows else []
+
+            args_json = json.dumps(args) if args is not None else None
+            cols_json = json.dumps(cols) if cols else None
+            rows_json = json.dumps(capped_rows) if capped_rows else None
+            row_count = len(rows) if rows else 0
+
+            cursor.execute(
+                """
+                INSERT INTO message_artifacts 
+                (message_id, tool, args, sql_query, result_columns, result_rows, row_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (msg_id, tool, args_json, sql, cols_json, rows_json, row_count)
+            )
+
         conn.commit()
 
 def get_recent_messages(session_id: str, limit: int = 50):
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT role, content, timestamp FROM messages 
-            WHERE session_id = ? 
-            ORDER BY timestamp DESC, id DESC LIMIT ?
+            SELECT m.id, m.role, m.content, m.timestamp,
+                   a.tool, a.args, a.sql_query, a.result_columns, a.result_rows
+            FROM messages m
+            LEFT JOIN message_artifacts a ON m.id = a.message_id
+            WHERE m.session_id = ? 
+            ORDER BY m.timestamp DESC, m.id DESC LIMIT ?
             """,
             (session_id, limit)
         ).fetchall()
-        # Return chronological order (oldest first)
-        return [{"role": r["role"], "content": r["content"], "created_at": r["timestamp"]} for r in reversed(rows)]
+
+        result = []
+        for r in reversed(rows):
+            msg = {
+                "id": r["id"],
+                "role": r["role"],
+                "content": r["content"],
+                "created_at": r["timestamp"]
+            }
+            if r["role"] == "assistant":
+                msg["tool"] = r["tool"]
+                msg["sql"] = r["sql_query"]
+                
+                args_val = {}
+                if r["args"]:
+                    try:
+                        args_val = json.loads(r["args"])
+                    except Exception:
+                        pass
+                msg["args"] = args_val
+
+                cols_val = []
+                rows_val = []
+                if r["result_columns"]:
+                    try:
+                        cols_val = json.loads(r["result_columns"])
+                    except Exception:
+                        pass
+                if r["result_rows"]:
+                    try:
+                        rows_val = json.loads(r["result_rows"])
+                    except Exception:
+                        pass
+                
+                msg["data"] = {"columns": cols_val, "rows": rows_val}
+
+            result.append(msg)
+
+        return result
+
 
 def save_session_state(session_id: str, user_id: int, ledger: str, summary: str):
     with get_connection() as conn:
