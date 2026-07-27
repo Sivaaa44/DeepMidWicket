@@ -37,3 +37,22 @@ export const getSessionMessages = async (session_id, token) => {
   const { data } = await axios.get(`${BASE}/sessions/${session_id}/messages`, { headers })
   return data
 }
+
+export const getSessions = async (token, limit = 20, offset = 0) => {
+  const headers = token ? { Authorization: `Bearer ${token}` } : {}
+  const { data } = await axios.get(`${BASE}/sessions?limit=${limit}&offset=${offset}`, { headers })
+  return data
+}
+
+export const renameSession = async (session_id, title, token) => {
+  const headers = token ? { Authorization: `Bearer ${token}` } : {}
+  const { data } = await axios.patch(`${BASE}/sessions/${session_id}`, { title }, { headers })
+  return data
+}
+
+export const deleteSession = async (session_id, token) => {
+  const headers = token ? { Authorization: `Bearer ${token}` } : {}
+  const { data } = await axios.delete(`${BASE}/sessions/${session_id}`, { headers })
+  return data
+}
+

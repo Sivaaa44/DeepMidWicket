@@ -46,10 +46,22 @@ export function useSession() {
     return newId
   }, [])
 
+  const switchSession = useCallback((sessionId) => {
+    try {
+      localStorage.setItem(ACTIVE_SESSION_KEY, sessionId)
+    } catch (e) {
+      console.error('Failed to save session_id to localStorage:', e)
+    }
+    setActiveSessionId(sessionId)
+    setIsExistingSession(true)
+  }, [])
+
   return {
     activeSessionId,
     startNewSession,
+    switchSession,
     isExistingSession,
     setIsExistingSession,
   }
 }
+

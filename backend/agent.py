@@ -655,7 +655,7 @@ PLAYER_COMPARISON_PROMPT = """You are an expert cricket analyst and SQLite query
 
 {schema}
 
-Write a single SQLite SELECT query to compare two players.
+Write a single SQLite SELECT query to compare players.
 
 RULES:
 - BOWLER WICKETS: exclude run outs — SUM(CASE WHEN is_wicket = 1 AND wicket_kind != 'run out' THEN 1 ELSE 0 END)
@@ -666,17 +666,16 @@ RULES:
 
 For batter_vs_batter:
   - Filter: WHERE batter LIKE '%p1%' OR batter LIKE '%p2%'
-  - GROUP BY player label using CASE WHEN
-  - Include: runs, balls_faced, strike_rate, average, fours, sixes, dismissals
+  - GROUP BY player label using CASE WHEN (e.g. CASE WHEN batter LIKE '%p1%' THEN 'Player 1' ELSE 'Player 2' END) AS player
+  - Include columns: player, runs, balls, strike_rate, average, fours, sixes, dismissals
 
 For bowler_vs_bowler:
   - Filter: WHERE bowler LIKE '%p1%' OR bowler LIKE '%p2%'
-  - GROUP BY player label
-  - Include: wickets (excluding run outs), balls_bowled, economy, bowling_average, bowling_sr
+  - GROUP BY player label using CASE WHEN AS player
+  - Include columns: player, wickets, balls_bowled, economy, bowling_average, bowling_sr
 
 For batter_vs_bowler (HEAD TO HEAD):
   - Filter: WHERE batter LIKE '%batter%' AND bowler LIKE '%bowler%'
-  - Figure out who is batter and who is bowler from context
   - Include: balls_faced, runs_scored, dismissals, strike_rate, dot_balls, fours, sixes
   - dot_balls = COUNT(CASE WHEN runs_batter = 0 AND (extras_type IS NULL OR extras_type NOT IN ('wides','noballs')) THEN 1 END)
   - dismissals = SUM(CASE WHEN is_wicket = 1 AND wicket_kind != 'run out' THEN 1 ELSE 0 END)
@@ -711,6 +710,9 @@ RULES:
 - Always JOIN matches when filtering by season, venue, or city
 - Limit to 15 rows unless a single value is requested
 - QUERY SCOPE: if user asks one specific thing, return only that. Don't add unrequested columns.
+- If comparing multiple players (e.g. 3 or more batters/bowlers like Kohli, Rohit and Dhoni):
+  - GROUP BY player name (using CASE WHEN or batter/bowler name)
+  - Return 1 row per player with columns: player, runs, balls, strike_rate, average, etc.
 - If comparing a player across seasons, GROUP BY m.season and return both seasons in one query
 
 Question: {question}
@@ -740,12 +742,12 @@ def route_question(question: str, context_str: str = None):
         "player_stats: one named player, asking about their performance stats\n"
         "  - Set specific_stat if user asks for just one thing e.g. 'wickets', 'runs', 'economy'\n"
         "  - Set specific_stat=null if user wants full stats or a profile\n\n"
-        "player_comparison: two players being compared OR head-to-head matchup\n"
+        "player_comparison: EXCLUSIVELY for comparing TWO named players OR a head-to-head matchup between two players.\n"
         "  - batter_vs_batter: two batters\n"
         "  - bowler_vs_bowler: two bowlers\n"
         "  - batter_vs_bowler: one batter one bowler, head to head\n\n"
-        "general_query: teams, venues, records, season comparisons, purple/orange cap, "
-        "win rates, toss stats, or comparing same player across multiple seasons. ONLY use this for queries requiring database statistics.\n\n"
+        "general_query: teams, venues, records, comparing THREE OR MORE players (e.g. 'compare Kohli, Rohit and Dhoni'), "
+        "season comparisons, purple/orange cap, win rates, toss stats. ONLY use this for queries requiring database statistics.\n\n"
         "general_chat: greetings, app status, how the app works, or generic queries that do NOT need database/SQL statistics.\n"
     )
     if context_str:

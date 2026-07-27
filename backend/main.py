@@ -8,17 +8,21 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from agent import ask
+from agent import ask, use_redis, redis_client
 from auth_routes import router as auth_router
 from admin_routes import router as admin_router
 from auth import decode_token, oauth2_scheme
-from auth_database import log_token_usage, check_user_limit, save_message, get_recent_messages, get_session_state
+from auth_database import (
+    log_token_usage, check_user_limit, save_message, 
+    get_recent_messages, get_session_state, get_user_sessions, 
+    update_session_title, delete_session_db
+)
 
 load_dotenv()
 
 app = FastAPI(title="Cricket Intelligence Agent")
 
-# Include Auth Routerx` `
+# Include Auth Router
 app.include_router(auth_router, prefix="/auth")
 
 # Include Admin Router
@@ -43,6 +47,10 @@ class QuestionRequest(BaseModel):
     session_id: Optional[str] = None
 
 
+class RenameSessionRequest(BaseModel):
+    title: str
+
+
 # In-memory store for anonymous IP usage
 anonymous_ip_usage = {}
 
@@ -57,9 +65,32 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/sessions/{session_id}/messages")
-def get_session_messages(session_id: str, token: str = Depends(oauth2_scheme)):
+@app.get("/sessions")
+@app.get("/api/sessions")
+def list_sessions(
+    request: Request,
+    limit: int = 20,
+    offset: int = 0,
+    token: str = Depends(oauth2_scheme)
+):
     user_id = None
+    client_ip = request.client.host if request.client else "unknown"
+    if token:
+        try:
+            user = decode_token(token)
+            user_id = user["id"]
+        except Exception:
+            pass
+
+    sessions = get_user_sessions(user_id=user_id, anon_ip=client_ip if not user_id else None, limit=limit, offset=offset)
+    return {"sessions": sessions}
+
+
+@app.get("/sessions/{session_id}/messages")
+@app.get("/api/sessions/{session_id}/messages")
+def get_session_messages(session_id: str, request: Request, token: str = Depends(oauth2_scheme)):
+    user_id = None
+    client_ip = request.client.host if request.client else "unknown"
     if token:
         try:
             user = decode_token(token)
@@ -68,8 +99,14 @@ def get_session_messages(session_id: str, token: str = Depends(oauth2_scheme)):
             pass
 
     state = get_session_state(session_id)
-    if state and state.get("user_id") is not None:
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if state.get("user_id") is not None:
         if user_id != state.get("user_id"):
+            raise HTTPException(status_code=403, detail="Not authorized to access this session's messages")
+    elif state.get("anon_ip") is not None:
+        if user_id is not None or client_ip != state.get("anon_ip"):
             raise HTTPException(status_code=403, detail="Not authorized to access this session's messages")
 
     try:
@@ -77,6 +114,72 @@ def get_session_messages(session_id: str, token: str = Depends(oauth2_scheme)):
         return {"messages": messages}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/sessions/{session_id}")
+@app.patch("/api/sessions/{session_id}")
+def rename_session(
+    session_id: str,
+    body: RenameSessionRequest,
+    request: Request,
+    token: str = Depends(oauth2_scheme)
+):
+    user_id = None
+    client_ip = request.client.host if request.client else "unknown"
+    if token:
+        try:
+            user = decode_token(token)
+            user_id = user["id"]
+        except Exception:
+            pass
+
+    success = update_session_title(
+        session_id=session_id,
+        title=body.title,
+        user_id=user_id,
+        anon_ip=client_ip if not user_id else None
+    )
+    if not success:
+        raise HTTPException(status_code=403, detail="Not authorized or session does not exist")
+    return {"success": True, "session_id": session_id, "title": body.title}
+
+
+@app.delete("/sessions/{session_id}")
+@app.delete("/api/sessions/{session_id}")
+def delete_session(
+    session_id: str,
+    request: Request,
+    token: str = Depends(oauth2_scheme)
+):
+    user_id = None
+    client_ip = request.client.host if request.client else "unknown"
+    if token:
+        try:
+            user = decode_token(token)
+            user_id = user["id"]
+        except Exception:
+            pass
+
+    success = delete_session_db(
+        session_id=session_id,
+        user_id=user_id,
+        anon_ip=client_ip if not user_id else None
+    )
+    if not success:
+        raise HTTPException(status_code=403, detail="Not authorized or session does not exist")
+
+    # Clean up Redis keys if available
+    try:
+        if use_redis and redis_client:
+            redis_client.delete(
+                f"session:{session_id}:ledger",
+                f"session:{session_id}:summary",
+                f"session:{session_id}:hot_window"
+            )
+    except Exception:
+        pass
+
+    return {"success": True}
 
 
 @app.post("/ask")
@@ -145,8 +248,8 @@ def ask_question(
     latency_ms = int((time.perf_counter() - start_time) * 1000)
 
     # Queue async write-through to SQLite
-    background_tasks.add_task(save_message, session_id, "user", question_request.question)
-    background_tasks.add_task(save_message, session_id, "assistant", result.get("answer", ""))
+    background_tasks.add_task(save_message, session_id, "user", question_request.question, user_id, client_ip)
+    background_tasks.add_task(save_message, session_id, "assistant", result.get("answer", ""), user_id, client_ip)
 
     # Inject session_id into response
     result["session_id"] = session_id
@@ -172,4 +275,4 @@ def ask_question(
     except Exception as log_err:
         print(f"Failed to log token usage: {log_err}")
 
-    return result
+    return result

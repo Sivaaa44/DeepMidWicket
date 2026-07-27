@@ -9,6 +9,7 @@ export default function InputBar({
   loading,
   onExampleClick,
   centered = false,
+  sidebarOpen = false,
 }) {
   const submit = () => onSubmit(value)
 
@@ -58,9 +59,14 @@ export default function InputBar({
   }
 
   return (
-    <footer className="fixed bottom-0 left-0 right-0 z-50 border-t border-[#222] bg-black p-4">
+    <footer
+      className={`fixed bottom-0 right-0 z-30 border-t border-[#222] bg-black p-4 transition-all duration-200 ${
+        sidebarOpen ? 'md:left-72 left-0' : 'left-0'
+      }`}
+    >
       <div className="mx-auto max-w-3xl">{form}</div>
     </footer>
   )
 }
+
 

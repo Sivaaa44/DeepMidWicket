@@ -67,17 +67,22 @@ def init_db():
         if "monthly_token_limit" not in columns:
             conn.execute("ALTER TABLE users ADD COLUMN monthly_token_limit INTEGER DEFAULT 50000")
             
-        # Schema migration to add new columns to token_usage if they don't exist
-        cursor.execute("PRAGMA table_info(token_usage)")
-        token_usage_cols = [row[1] for row in cursor.fetchall()]
-        if "success" not in token_usage_cols:
-            conn.execute("ALTER TABLE token_usage ADD COLUMN success INTEGER DEFAULT 1")
-        if "error_message" not in token_usage_cols:
-            conn.execute("ALTER TABLE token_usage ADD COLUMN error_message TEXT")
-        if "latency_ms" not in token_usage_cols:
-            conn.execute("ALTER TABLE token_usage ADD COLUMN latency_ms INTEGER")
-        if "ip_address" not in token_usage_cols:
-            conn.execute("ALTER TABLE token_usage ADD COLUMN ip_address TEXT")
+        # Schema migration to add missing columns and indices for sessions
+        cursor.execute("PRAGMA table_info(sessions)")
+        sessions_cols = [row[1] for row in cursor.fetchall()]
+        if "anon_ip" not in sessions_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN anon_ip TEXT")
+        if "title" not in sessions_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT 'New Chat'")
+        if "created_at" not in sessions_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN created_at TEXT")
+        if "last_message_preview" not in sessions_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN last_message_preview TEXT")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_anon_ip ON sessions(anon_ip)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
             
         conn.commit()
 
@@ -174,31 +179,65 @@ def check_user_limit(user_id):
         "remaining": remaining
     }
 
-def save_message(session_id: str, role: str, content: str):
+def save_message(session_id: str, role: str, content: str, user_id=None, anon_ip=None):
     with get_connection() as conn:
-        # Ensure the session exists first (with NULL user_id by default if not set yet)
-        conn.execute(
-            "INSERT OR IGNORE INTO sessions (session_id, user_id) VALUES (?, NULL)",
-            (session_id,)
-        )
-        conn.execute(
+        cursor = conn.cursor()
+        cursor.execute("SELECT session_id, title, user_id, anon_ip FROM sessions WHERE session_id = ?", (session_id,))
+        session_row = cursor.fetchone()
+
+        preview = content[:100] if content else ""
+
+        if not session_row:
+            # First message / new session creation
+            initial_title = "New Chat"
+            if role == "user" and content:
+                clean_content = content.strip()
+                initial_title = clean_content[:40].strip() + ("..." if len(clean_content) > 40 else "")
+            
+            cursor.execute(
+                """
+                INSERT INTO sessions (session_id, user_id, anon_ip, title, last_message_preview, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (session_id, user_id, anon_ip, initial_title, preview)
+            )
+        else:
+            current_title = session_row["title"]
+            curr_user = session_row["user_id"] or user_id
+            curr_ip = session_row["anon_ip"] or anon_ip
+
+            # Auto title if title is still 'New Chat' and user is sending message
+            if (current_title == "New Chat" or not current_title) and role == "user" and content:
+                clean_content = content.strip()
+                current_title = clean_content[:40].strip() + ("..." if len(clean_content) > 40 else "")
+
+            cursor.execute(
+                """
+                UPDATE sessions 
+                SET user_id = ?, anon_ip = ?, title = ?, last_message_preview = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+                """,
+                (curr_user, curr_ip, current_title, preview, session_id)
+            )
+
+        cursor.execute(
             "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
             (session_id, role, content)
         )
         conn.commit()
 
-def get_recent_messages(session_id: str, limit: int = 10):
+def get_recent_messages(session_id: str, limit: int = 50):
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT role, content FROM messages 
+            SELECT role, content, timestamp FROM messages 
             WHERE session_id = ? 
             ORDER BY timestamp DESC, id DESC LIMIT ?
             """,
             (session_id, limit)
         ).fetchall()
         # Return chronological order (oldest first)
-        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+        return [{"role": r["role"], "content": r["content"], "created_at": r["timestamp"]} for r in reversed(rows)]
 
 def save_session_state(session_id: str, user_id: int, ledger: str, summary: str):
     with get_connection() as conn:
@@ -219,8 +258,81 @@ def save_session_state(session_id: str, user_id: int, ledger: str, summary: str)
 def get_session_state(session_id: str):
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT user_id, ledger, summary FROM sessions WHERE session_id = ?",
+            "SELECT session_id, user_id, anon_ip, title, created_at, updated_at, last_message_preview, ledger, summary FROM sessions WHERE session_id = ?",
             (session_id,)
         ).fetchone()
         return dict(row) if row else None
+
+def get_user_sessions(user_id=None, anon_ip=None, limit: int = 20, offset: int = 0):
+    with get_connection() as conn:
+        if user_id is not None:
+            rows = conn.execute(
+                """
+                SELECT session_id AS id, title, created_at, updated_at, last_message_preview
+                FROM sessions
+                WHERE user_id = ?
+                ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (user_id, limit, offset)
+            ).fetchall()
+        elif anon_ip is not None:
+            rows = conn.execute(
+                """
+                SELECT session_id AS id, title, created_at, updated_at, last_message_preview
+                FROM sessions
+                WHERE user_id IS NULL AND anon_ip = ?
+                ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (anon_ip, limit, offset)
+            ).fetchall()
+        else:
+            rows = []
+        return [dict(r) for r in rows]
+
+def update_session_title(session_id: str, title: str, user_id=None, anon_ip=None) -> bool:
+    with get_connection() as conn:
+        session = get_session_state(session_id)
+        if not session:
+            return False
+        
+        # Verify ownership
+        if user_id is not None:
+            if session["user_id"] != user_id:
+                return False
+        elif anon_ip is not None:
+            if session["user_id"] is not None or session["anon_ip"] != anon_ip:
+                return False
+        else:
+            return False
+
+        conn.execute(
+            "UPDATE sessions SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+            (title.strip() or "New Chat", session_id)
+        )
+        conn.commit()
+        return True
+
+def delete_session_db(session_id: str, user_id=None, anon_ip=None) -> bool:
+    with get_connection() as conn:
+        session = get_session_state(session_id)
+        if not session:
+            return False
+        
+        # Verify ownership
+        if user_id is not None:
+            if session["user_id"] != user_id:
+                return False
+        elif anon_ip is not None:
+            if session["user_id"] is not None or session["anon_ip"] != anon_ip:
+                return False
+        else:
+            return False
+
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
+        return True
+
 
