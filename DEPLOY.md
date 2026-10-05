@@ -43,6 +43,20 @@ Deploy the **backend** on [Render](https://render.com) and the **frontend** on [
    |-----|--------|
    | `GROQ_API_KEY` | your Groq key |
    | `ALLOWED_ORIGINS` | your Vercel URL (and `http://localhost:5173` if you test locally against prod API) |
+   | `ENVIRONMENT` | `production` (the API refuses to start without `JWT_SECRET` in production) |
+   | `JWT_SECRET` | a long random string, e.g. `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
+   | `ADMIN_EMAILS` | comma-separated emails that get the `/admin` dashboard |
+   | `REDIS_URL` | optional context cache; SQLite is always the source of truth |
+
+   **Persistence:** `users.db` (accounts, chats, usage) is created at runtime and is no longer
+   committed. Render's filesystem is wiped on every deploy, so attach a persistent disk
+   (e.g. mounted at `/var/data`) and set `USERS_DB_PATH=/var/data/users.db`.
+
+   All other tunables (quotas, models, memory window, timeouts) are documented in
+   `backend/.env.example`.
+
+   Use `uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'`
+   as the start command so guest quotas see real client IPs instead of Render's proxy.
 
 4. **Create Web Service** and wait for deploy.
 
@@ -50,7 +64,7 @@ Deploy the **backend** on [Render](https://render.com) and the **frontend** on [
 
 ```bash
 curl https://YOUR-SERVICE.onrender.com/health
-# {"status":"ok"}
+# {"status":"ok","checks":{"redis":"disabled","llm":"configured","cricket_db":"ok"},...}
 
 curl -X POST https://YOUR-SERVICE.onrender.com/ask \
   -H "Content-Type: application/json" \
