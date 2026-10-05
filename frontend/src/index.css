@@ -6,53 +6,98 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/*
+ * Design tokens. The app is dark-only by design; every color is defined here once.
+ * Series colors are the validated dark categorical slots (CVD-checked against --surface-chart).
+ */
 :root {
-  --radius: 0.5rem;
-  --background: #000000;
-  --foreground: #ffffff;
-  --card: #000000;
-  --card-foreground: #ffffff;
-  --popover: #000000;
-  --popover-foreground: #ffffff;
-  --primary: #ffffff;
-  --primary-foreground: #000000;
-  --secondary: #0a0a0a;
-  --secondary-foreground: #ffffff;
-  --muted: #0a0a0a;
-  --muted-foreground: #888888;
-  --accent: #111111;
-  --accent-foreground: #ffffff;
-  --destructive: #ef4444;
-  --border: #222222;
-  --input: #222222;
-  --ring: #444444;
-}
+  color-scheme: dark;
+  --radius: 0.75rem;
 
-.dark {
-  --background: #000000;
-  --foreground: #ffffff;
-  --card: #000000;
-  --card-foreground: #ffffff;
-  --popover: #000000;
-  --popover-foreground: #ffffff;
-  --primary: #ffffff;
-  --primary-foreground: #000000;
-  --secondary: #0a0a0a;
-  --secondary-foreground: #ffffff;
-  --muted: #0a0a0a;
-  --muted-foreground: #888888;
-  --accent: #111111;
-  --accent-foreground: #ffffff;
-  --destructive: #ef4444;
-  --border: #222222;
-  --input: #222222;
-  --ring: #444444;
+  /* Planes */
+  --page: #07080b;
+  --surface-1: rgba(22, 24, 30, 0.62);
+  --surface-2: rgba(32, 35, 43, 0.66);
+  --surface-solid: #111318;
+  --surface-chart: #0c0e12;
+  --hover: rgba(255, 255, 255, 0.045);
+  --active: rgba(255, 255, 255, 0.075);
+
+  /* Lines */
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.13);
+  --grid: rgba(255, 255, 255, 0.06);
+
+  /* Ink */
+  --ink-1: #f4f5f7;
+  --ink-2: #b4b8c2;
+  --ink-3: #7d828c;
+
+  /* Brand */
+  --accent: #6e8bff;
+  --accent-ink: #a9b8ff;
+  --accent-soft: rgba(110, 139, 255, 0.14);
+
+  /* Data series (dark categorical slots, fixed order) */
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+
+  /* Status — always paired with an icon and label */
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+
+  /* shadcn compatibility */
+  --background: var(--page);
+  --foreground: var(--ink-1);
+  --card: var(--surface-solid);
+  --card-foreground: var(--ink-1);
+  --popover: #12141a;
+  --popover-foreground: var(--ink-1);
+  --primary: var(--ink-1);
+  --primary-foreground: #07080b;
+  --secondary: #16181e;
+  --secondary-foreground: var(--ink-1);
+  --muted: #16181e;
+  --muted-foreground: var(--ink-3);
+  --accent-ui: #1b1e25;
+  --destructive: #ef5350;
+  --border: var(--line);
+  --input: var(--line-strong);
+  --ring: rgba(110, 139, 255, 0.55);
 }
 
 @theme inline {
   --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
   --font-heading: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono Variable", ui-monospace, monospace;
+
+  --color-page: var(--page);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-solid: var(--surface-solid);
+  --color-hover: var(--hover);
+  --color-active: var(--active);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink-1: var(--ink-1);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-brand: var(--accent);
+  --color-brand-ink: var(--accent-ink);
+  --color-brand-soft: var(--accent-soft);
+  --color-series-1: var(--series-1);
+  --color-series-2: var(--series-2);
+  --color-series-3: var(--series-3);
+  --color-series-4: var(--series-4);
+  --color-good: var(--good);
+  --color-warning: var(--warning);
+  --color-serious: var(--serious);
+  --color-critical: var(--critical);
+
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -65,16 +110,35 @@
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
-  --color-accent: var(--accent);
-  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent-ui);
+  --color-accent-foreground: var(--ink-1);
   --color-destructive: var(--destructive);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
-  --radius-sm: calc(var(--radius) * 0.6);
-  --radius-md: calc(var(--radius) * 0.8);
+  --radius-sm: calc(var(--radius) * 0.5);
+  --radius-md: calc(var(--radius) * 0.75);
   --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-xl: calc(var(--radius) * 1.33);
+
+  --animate-fade-up: fade-up 0.42s cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-shimmer: shimmer 1.6s linear infinite;
+  --animate-pulse-soft: pulse-soft 1.8s ease-in-out infinite;
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes shimmer {
+  from { background-position: -200% 0; }
+  to { background-position: 200% 0; }
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
 }
 
 @layer base {
@@ -83,8 +147,105 @@
   }
   html {
     @apply font-sans antialiased;
+    background: var(--page);
   }
   body {
-    @apply bg-black text-foreground min-h-dvh overflow-hidden;
+    @apply text-ink-1 min-h-dvh overflow-hidden;
+    background: var(--page);
+    font-feature-settings: "ss01", "cv11";
+  }
+  ::selection {
+    background: rgba(110, 139, 255, 0.35);
+  }
+  /* Quiet scrollbars */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* Ambient light behind the glass */
+  .app-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(60rem 40rem at 85% -10%, rgba(110, 139, 255, 0.10), transparent 60%),
+      radial-gradient(50rem 36rem at -10% 110%, rgba(25, 158, 112, 0.07), transparent 60%),
+      var(--page);
+  }
+  .app-backdrop::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: radial-gradient(ellipse at 50% 0%, black 0%, transparent 70%);
+    opacity: 0.35;
+  }
+
+  .glass {
+    background: var(--surface-1);
+    border: 1px solid var(--line);
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
+  }
+  .glass-strong {
+    background: rgba(18, 20, 26, 0.86);
+    border: 1px solid var(--line-strong);
+    backdrop-filter: blur(24px) saturate(150%);
+    -webkit-backdrop-filter: blur(24px) saturate(150%);
+  }
+  /* Hairline highlight along the top edge of raised panels */
+  .edge-light {
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 12px 40px -16px rgba(0, 0, 0, 0.7);
+  }
+
+  .shimmer-text {
+    background: linear-gradient(90deg, var(--ink-3) 0%, var(--ink-1) 50%, var(--ink-3) 100%);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: var(--animate-shimmer);
+  }
+
+  .skeleton {
+    background: linear-gradient(90deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.09) 50%, rgba(255,255,255,0.04) 100%);
+    background-size: 200% 100%;
+    animation: var(--animate-shimmer);
+    border-radius: 6px;
+  }
+
+  .brand-mark {
+    background: conic-gradient(from 210deg, #6e8bff, #3987e5, #199e70, #6e8bff);
+  }
+
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .prose-answer p + p { margin-top: 0.75rem; }
+  .prose-answer ul { margin: 0.5rem 0 0.5rem 1.1rem; list-style: disc; }
+  .prose-answer li + li { margin-top: 0.25rem; }
+  .prose-answer strong { color: var(--ink-1); font-weight: 600; }
+
+  .sql-keyword { color: #a9b8ff; }
+  .sql-string { color: #7fd1ae; }
+  .sql-number { color: #f0b46b; }
+  .sql-comment { color: var(--ink-3); font-style: italic; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
   }
 }

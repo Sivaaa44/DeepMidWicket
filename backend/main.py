@@ -1,289 +1,243 @@
-import os
+import json
+import logging
+import queue
+import re
+import threading
 import time
 import uuid
-from typing import Optional
 
-# pyrefly: ignore [missing-import]
-from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, Request, HTTPException, BackgroundTasks
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from agent import ask, use_redis, redis_client
-from auth_routes import router as auth_router
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+import agent
+import config
+import memory
 from admin_routes import router as admin_router
-from auth import decode_token, oauth2_scheme
+from auth import Identity, get_identity
 from auth_database import (
-    log_token_usage, check_user_limit, save_message, 
-    get_recent_messages, get_session_state, get_user_sessions, 
-    update_session_title, delete_session_db
+    can_access_session, check_anon_limit, check_user_limit, delete_session_db, get_recent_messages,
+    get_session_state, get_user_sessions, log_token_usage, save_turn, update_session_title,
 )
+from auth_routes import router as auth_router
 
-load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+log = logging.getLogger("api")
 
-app = FastAPI(title="Cricket Intelligence Agent")
+STARTED_AT = time.time()
 
-# Include Auth Router
-app.include_router(auth_router, prefix="/auth")
-
-# Include Admin Router
-app.include_router(admin_router, prefix="/admin")
-
-_allowed = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173",
-)
-origins = [o.strip() for o in _allowed.split(",") if o.strip()]
-
+app = FastAPI(title="DeepMidWicket — Cricket Intelligence API")
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
+app.include_router(admin_router, prefix="/admin", tags=["admin"])
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=config.ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Key"],
 )
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
 class QuestionRequest(BaseModel):
-    question: str
-    session_id: Optional[str] = None
+    question: str = Field(min_length=1, max_length=config.MAX_QUESTION_LENGTH)
+    session_id: str | None = None
 
 
 class RenameSessionRequest(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=200)
 
 
-# In-memory store for anonymous IP usage
-anonymous_ip_usage = {}
+def _session_or_404(session_id: str, identity: Identity) -> dict:
+    state = get_session_state(session_id)
+    if not state or not can_access_session(state, identity.user_id, identity.anon_ip):
+        # Same response for "missing" and "not yours" so IDs can't be probed.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    return state
 
+
+def current_quota(identity: Identity) -> dict:
+    if identity.user:
+        return {"authenticated": True, **check_user_limit(identity.user_id)}
+    return {"authenticated": False, **check_anon_limit(identity.ip)}
+
+
+# ── Health ───────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"status": "Cricket Intelligence Agent is running"}
+    return {"status": "ok", "service": "deepmidwicket"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    checks = {"redis": memory.redis_status(), "llm": "configured" if config.GROQ_API_KEY else "missing_key"}
+    try:
+        agent.dataset_description()
+        from database import get_dataset_summary
+        get_dataset_summary()
+        checks["cricket_db"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        checks["cricket_db"] = f"error: {e}"
+    healthy = checks["cricket_db"] == "ok" and checks["llm"] == "configured"
+    return {"status": "ok" if healthy else "degraded", "checks": checks, "uptime_s": int(time.time() - STARTED_AT)}
 
+
+# ── Sessions ─────────────────────────────────────────────────────────────────
 
 @app.get("/sessions")
-@app.get("/api/sessions")
 def list_sessions(
-    request: Request,
-    limit: int = 20,
-    offset: int = 0,
-    token: str = Depends(oauth2_scheme)
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    q: str | None = Query(None, max_length=100),
+    identity: Identity = Depends(get_identity),
 ):
-    user_id = None
-    client_ip = request.client.host if request.client else "unknown"
-    if token:
-        try:
-            user = decode_token(token)
-            user_id = user["id"]
-        except Exception:
-            pass
-
-    sessions = get_user_sessions(user_id=user_id, anon_ip=client_ip if not user_id else None, limit=limit, offset=offset)
-    return {"sessions": sessions}
+    sessions = get_user_sessions(identity.user_id, identity.anon_ip, limit=limit + 1, offset=offset, search=q)
+    return {"sessions": sessions[:limit], "has_more": len(sessions) > limit}
 
 
 @app.get("/sessions/{session_id}/messages")
-@app.get("/api/sessions/{session_id}/messages")
-def get_session_messages(session_id: str, request: Request, token: str = Depends(oauth2_scheme)):
-    user_id = None
-    client_ip = request.client.host if request.client else "unknown"
-    if token:
-        try:
-            user = decode_token(token)
-            user_id = user["id"]
-        except Exception:
-            pass
-
-    state = get_session_state(session_id)
-    if not state:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    if state.get("user_id") is not None:
-        if user_id != state.get("user_id"):
-            raise HTTPException(status_code=403, detail="Not authorized to access this session's messages")
-    elif state.get("anon_ip") is not None:
-        if user_id is not None or client_ip != state.get("anon_ip"):
-            raise HTTPException(status_code=403, detail="Not authorized to access this session's messages")
-
-    try:
-        messages = get_recent_messages(session_id, limit=50)
-        return {"messages": messages}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def get_session_messages(
+    session_id: str,
+    limit: int = Query(200, ge=1, le=1000),
+    identity: Identity = Depends(get_identity),
+):
+    state = _session_or_404(session_id, identity)
+    return {
+        "session": {"id": session_id, "title": state["title"], "created_at": state["created_at"],
+                    "updated_at": state["updated_at"]},
+        "messages": get_recent_messages(session_id, limit=limit),
+    }
 
 
 @app.patch("/sessions/{session_id}")
-@app.patch("/api/sessions/{session_id}")
-def rename_session(
-    session_id: str,
-    body: RenameSessionRequest,
-    request: Request,
-    token: str = Depends(oauth2_scheme)
-):
-    user_id = None
-    client_ip = request.client.host if request.client else "unknown"
-    if token:
-        try:
-            user = decode_token(token)
-            user_id = user["id"]
-        except Exception:
-            pass
-
-    success = update_session_title(
-        session_id=session_id,
-        title=body.title,
-        user_id=user_id,
-        anon_ip=client_ip if not user_id else None
-    )
-    if not success:
-        raise HTTPException(status_code=403, detail="Not authorized or session does not exist")
-    return {"success": True, "session_id": session_id, "title": body.title}
+def rename_session(session_id: str, body: RenameSessionRequest, identity: Identity = Depends(get_identity)):
+    _session_or_404(session_id, identity)
+    update_session_title(session_id, body.title, identity.user_id, identity.anon_ip)
+    return {"id": session_id, "title": get_session_state(session_id)["title"]}
 
 
 @app.delete("/sessions/{session_id}")
-@app.delete("/api/sessions/{session_id}")
-def delete_session(
-    session_id: str,
-    request: Request,
-    token: str = Depends(oauth2_scheme)
-):
-    user_id = None
-    client_ip = request.client.host if request.client else "unknown"
-    if token:
-        try:
-            user = decode_token(token)
-            user_id = user["id"]
-        except Exception:
-            pass
-
-    success = delete_session_db(
-        session_id=session_id,
-        user_id=user_id,
-        anon_ip=client_ip if not user_id else None
-    )
-    if not success:
-        raise HTTPException(status_code=403, detail="Not authorized or session does not exist")
-
-    # Clean up Redis keys if available
-    try:
-        if use_redis and redis_client:
-            redis_client.delete(
-                f"session:{session_id}:ledger",
-                f"session:{session_id}:summary",
-                f"session:{session_id}:hot_window"
-            )
-    except Exception:
-        pass
-
+def delete_session(session_id: str, identity: Identity = Depends(get_identity)):
+    _session_or_404(session_id, identity)
+    delete_session_db(session_id, identity.user_id, identity.anon_ip)
+    memory.invalidate_cache(session_id)
     return {"success": True}
 
 
-@app.post("/ask")
-def ask_question(
-    question_request: QuestionRequest, 
-    request: Request, 
-    background_tasks: BackgroundTasks,
-    token: str = Depends(oauth2_scheme)
-):
-    user_id = None
-    user = None
-    client_ip = request.client.host if request.client else "unknown"
+# ── Asking ───────────────────────────────────────────────────────────────────
 
-    if token:
+def prepare_turn(body: QuestionRequest, identity: Identity) -> tuple[str, str]:
+    """Validate everything that should fail fast with an HTTP error, before any LLM work."""
+    question = " ".join(body.question.split())
+    if not question:
+        raise HTTPException(status_code=422, detail="Please type a question.")
+
+    session_id = body.session_id or str(uuid.uuid4())
+    if not SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=422, detail="Invalid conversation id.")
+    if get_session_state(session_id) is not None:
+        _session_or_404(session_id, identity)
+
+    quota = current_quota(identity)
+    if not quota["allowed"]:
+        if identity.user:
+            message = (f"You've used your {quota['limit']:,} token allowance for this month. "
+                       f"It resets on {quota['reset_date']}.")
+        else:
+            message = (f"You've used your {quota['limit']} free questions. "
+                       "Create a free account to keep going.")
+        raise HTTPException(status_code=429, detail={"code": "quota_exceeded", "message": message, "quota": quota})
+    return question, session_id
+
+
+def _summarizer(identity: Identity, session_id: str):
+    def run(old_summary, messages):
+        usage = agent.Usage()
         try:
-            user = decode_token(token)
-            user_id = user["id"]
-        except Exception:
-            pass
+            return agent.summarize(old_summary, messages, usage)
+        finally:
+            tokens = usage.as_dict()
+            if tokens["total"]:
+                log_token_usage(identity.user_id, "[conversation summary]", "summarizer", tokens["input"],
+                                tokens["output"], ip_address=identity.ip, request_type="summary",
+                                session_id=session_id)
+    return run
 
-    if user_id:
-        # Check token limit for authenticated user
-        limit_info = check_user_limit(user_id)
-        if not limit_info["allowed"]:
-            raise HTTPException(
-                status_code=429,
-                detail="Monthly limit reached (50,000 tokens). Usage resets on the 1st."
-            )
-    else:
-        # Anonymous user: track by IP
-        current_count = anonymous_ip_usage.get(client_ip, 0)
-        if current_count >= 5:
-            raise HTTPException(
-                status_code=429,
-                detail="Sign up for free to ask more questions."
-            )
-        anonymous_ip_usage[client_ip] = current_count + 1
 
-    # Extract or generate session_id
-    session_id = question_request.session_id or str(uuid.uuid4())
+def execute_turn(question: str, session_id: str, identity: Identity, on_event=None) -> dict:
+    ctx = memory.load_context(session_id)
+    result = agent.ask(question, session_id=session_id, on_event=on_event, context=ctx)
+    error = result.get("error")
 
-    start_time = time.perf_counter()
-    success = 1
-    error_message = None
-    result = None
+    saved = save_turn(session_id, question, result, user_id=identity.user_id, anon_ip=identity.anon_ip)
+    memory.record_turn(session_id, ctx["ledger"], question, result.get("tool"), result.get("args"),
+                       succeeded=error is None)
 
+    tokens = result["tokens"]
     try:
-        # Execute ask with session context parameters
-        result = ask(question_request.question, session_id=session_id, user_id=user_id)
-        if result and (result.get("data") is None or "Error:" in str(result.get("answer", "")) or "An internal error occurred" in str(result.get("answer", ""))):
-            success = 0
-            error_message = result.get("answer") or "Unknown agent error"
-    except Exception as e:
-        success = 0
-        error_message = str(e)
-        result = {
-            "question": question_request.question,
-            "tool": "unknown",
-            "args": {},
-            "sql": None,
-            "answer": "An internal error occurred. Please try again later.",
-            "data": None,
-            "tokens": {"input": 0, "output": 0, "total": 0}
-        }
-
-    latency_ms = int((time.perf_counter() - start_time) * 1000)
-
-    # Queue async write-through to SQLite
-    background_tasks.add_task(save_message, session_id, "user", question_request.question, user_id, client_ip)
-    background_tasks.add_task(
-        save_message, 
-        session_id, 
-        "assistant", 
-        result.get("answer", ""), 
-        user_id, 
-        client_ip,
-        tool=result.get("tool"),
-        args=result.get("args"),
-        sql=result.get("sql"),
-        data=result.get("data")
-    )
-
-    # Inject session_id into response
-    result["session_id"] = session_id
-
-    # Log token usage (for both authenticated and anonymous requests)
-    try:
-        tokens = result.get("tokens") or {"input": 0, "output": 0, "total": 0}
-        input_tokens = tokens.get("input", 0)
-        output_tokens = tokens.get("output", 0)
-        tool_used = result.get("tool") or "unknown"
-
         log_token_usage(
-            user_id=user_id,
-            question=question_request.question,
-            tool_used=tool_used,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            success=success,
-            error_message=error_message,
-            latency_ms=latency_ms,
-            ip_address=client_ip
+            user_id=identity.user_id, question=question, tool_used=result.get("tool") or "unknown",
+            input_tokens=tokens["input"], output_tokens=tokens["output"], success=error is None,
+            error_message=f"[{error['code']}] {error.get('detail')}" if error else None,
+            latency_ms=result["timings"].get("total_ms"), ip_address=identity.ip,
+            request_type="ask", session_id=session_id,
         )
-    except Exception as log_err:
-        print(f"Failed to log token usage: {log_err}")
+    except Exception as e:  # noqa: BLE001 - accounting must never lose the user's answer
+        log.error("Failed to log token usage: %s", e)
 
-    return result
+    if error is None:
+        memory.maybe_summarize(session_id, _summarizer(identity, session_id))
+
+    if error:
+        result["error"] = {"code": error["code"], "message": error["message"]}  # hide internals
+    result["session_id"] = session_id
+    result["message_id"] = saved["assistant_message_id"]
+    result["quota"] = current_quota(identity)
+    return result
+
+
+@app.post("/ask")
+def ask_question(body: QuestionRequest, identity: Identity = Depends(get_identity)):
+    question, session_id = prepare_turn(body, identity)
+    return execute_turn(question, session_id, identity)
+
+
+def _sse(event: str, data) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+@app.post("/ask/stream")
+def ask_question_stream(body: QuestionRequest, identity: Identity = Depends(get_identity)):
+    """Server-sent events: `status` events for each pipeline stage, then one `result`."""
+    question, session_id = prepare_turn(body, identity)
+    events: queue.Queue = queue.Queue()
+    done = object()
+
+    def worker():
+        try:
+            events.put(("result", execute_turn(question, session_id, identity, on_event=lambda e: events.put(("status", e)))))
+        except Exception as e:  # noqa: BLE001
+            log.exception("Streaming turn failed")
+            events.put(("error", {"code": "internal_error", "message": "Something went wrong. Please try again.",
+                                  "detail": type(e).__name__}))
+        finally:
+            events.put(done)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def stream():
+        yield _sse("session", {"session_id": session_id})
+        while True:
+            try:
+                item = events.get(timeout=15)
+            except queue.Empty:
+                yield ": keep-alive\n\n"
+                continue
+            if item is done:
+                return
+            yield _sse(*item)
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

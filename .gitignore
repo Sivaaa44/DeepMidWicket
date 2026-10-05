@@ -10,3 +10,9 @@ dist/
 ipl_json/
 backend/logs/
 
+
+# Runtime application database (users, sessions) — never commit
+backend/users.db
+backend/users.db-*
+*.db-wal
+*.db-shm
