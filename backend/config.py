@@ -58,6 +58,12 @@ LLM_FAST_MODEL = os.getenv("LLM_FAST_MODEL", LLM_MODEL)  # used for summaries
 LLM_TIMEOUT_SECONDS = _float("LLM_TIMEOUT_SECONDS", 30.0)
 LLM_MAX_RETRIES = _int("LLM_MAX_RETRIES", 2)
 SQL_REPAIR_ATTEMPTS = _int("SQL_REPAIR_ATTEMPTS", 1)
+# Reasoning models (e.g. openai/gpt-oss-*) spend output tokens "thinking" before they answer,
+# so output budgets must leave room for that. Effort: low | medium | high.
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "low")
+MAX_TOKENS_SQL = _int("MAX_TOKENS_SQL", 2048)
+MAX_TOKENS_ANSWER = _int("MAX_TOKENS_ANSWER", 1024)
+MAX_TOKENS_SUMMARY = _int("MAX_TOKENS_SUMMARY", 768)
 
 # ── Query execution ──────────────────────────────────────────────────────────
 SQL_MAX_ROWS = _int("SQL_MAX_ROWS", 100)

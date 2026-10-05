@@ -21,9 +21,14 @@ from auth_database import (
     get_session_state, get_user_sessions, log_token_usage, save_turn, update_session_title,
 )
 from auth_routes import router as auth_router
+from database import ensure_indexes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 log = logging.getLogger("api")
+
+_created = ensure_indexes()
+if _created:
+    log.info("Created %d missing cricket.db indexes", _created)
 
 STARTED_AT = time.time()
 

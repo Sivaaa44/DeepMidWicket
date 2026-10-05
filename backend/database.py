@@ -69,6 +69,39 @@ def run_query(sql: str, max_rows: int = None):
         conn.close()
 
 
+INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_deliveries_match ON deliveries(match_id)",
+    "CREATE INDEX IF NOT EXISTS idx_deliveries_batter ON deliveries(batter)",
+    "CREATE INDEX IF NOT EXISTS idx_deliveries_bowler ON deliveries(bowler)",
+    "CREATE INDEX IF NOT EXISTS idx_matches_season_number ON matches(season, match_number)",
+)
+
+
+def ensure_indexes():
+    """
+    Create the indexes generated queries rely on (joins on match_id, finals lookups).
+    Without them a finals query scans ~20s; with them it takes well under a second.
+    Takes ~0.5s once; a no-op afterwards. Skipped quietly if the file is read-only.
+    """
+    try:
+        conn = sqlite3.connect(config.CRICKET_DB_PATH)
+        try:
+            existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+            missing = [s for s in INDEXES if s.split()[5] not in existing]
+            if missing:
+                for statement in missing:
+                    conn.execute(statement)
+                conn.execute("ANALYZE")
+                conn.commit()
+            return len(missing)
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        import logging
+        logging.getLogger("database").warning("Could not create cricket.db indexes: %s", e)
+        return 0
+
+
 def get_known_entities():
     """Distinct people, teams and places, used for rule-based entity extraction."""
     conn = _connect_readonly()
