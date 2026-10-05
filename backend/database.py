@@ -1,25 +1,101 @@
+import re
 import sqlite3
-import os
+import time
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "cricket.db")
+import config
 
 
-def run_query(sql: str):
-    """
-    Runs a SELECT query against the cricket database.
-    Returns (columns, rows) on success, raises Exception on failure.
-    """
-    cleaned = sql.strip().upper()
-    if not cleaned.startswith("SELECT"):
-        raise ValueError("Only SELECT queries are allowed.")
+class QueryError(Exception):
+    """Raised when a generated query is rejected or fails to execute."""
 
-    conn = sqlite3.connect(DB_PATH)
+
+_FORBIDDEN = re.compile(
+    r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|pragma|vacuum|reindex)\b",
+    re.IGNORECASE,
+)
+
+
+def clean_sql(sql: str) -> str:
+    """Strip markdown fences, comments and trailing semicolons from LLM output."""
+    text = re.sub(r"```(?:sql)?", "", sql or "", flags=re.IGNORECASE).strip()
+    text = re.sub(r"--[^\n]*", "", text)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return text.strip().rstrip(";").strip()
+
+
+def validate_sql(sql: str) -> str:
+    cleaned = clean_sql(sql)
+    if not cleaned:
+        raise QueryError("The generated query was empty.")
+    head = cleaned.split(None, 1)[0].upper()
+    if head not in ("SELECT", "WITH"):
+        raise QueryError("Only SELECT queries are allowed.")
+    if ";" in cleaned:
+        raise QueryError("Only a single statement is allowed.")
+    if _FORBIDDEN.search(cleaned):
+        raise QueryError("The query contains a forbidden keyword.")
+    return cleaned
+
+
+def _connect_readonly() -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{config.CRICKET_DB_PATH}?mode=ro", uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    return conn
+
+
+def run_query(sql: str, max_rows: int = None):
+    """
+    Run a validated, read-only SELECT against the cricket database.
+    Returns (cleaned_sql, columns, rows). Raises QueryError on rejection or failure.
+    """
+    cleaned = validate_sql(sql)
+    max_rows = max_rows or config.SQL_MAX_ROWS
+    conn = _connect_readonly()
+    deadline = time.monotonic() + config.SQL_TIMEOUT_SECONDS
+    # Abort long-running queries (returning non-zero interrupts execution).
+    conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
     try:
-        cursor = conn.execute(sql)
-        rows = cursor.fetchmany(50)
-        columns = [desc[0] for desc in cursor.description]
-        return columns, [dict(row) for row in rows]
+        cursor = conn.execute(cleaned)
+        rows = cursor.fetchmany(max_rows)
+        columns = [desc[0] for desc in cursor.description] if cursor.description else []
+        return cleaned, columns, [dict(row) for row in rows]
+    except sqlite3.OperationalError as e:
+        if "interrupted" in str(e).lower():
+            raise QueryError(f"Query exceeded the {config.SQL_TIMEOUT_SECONDS:g}s time limit.") from e
+        raise QueryError(str(e)) from e
+    except sqlite3.Error as e:
+        raise QueryError(str(e)) from e
+    finally:
+        conn.close()
+
+
+def get_known_entities():
+    """Distinct people, teams and places, used for rule-based entity extraction."""
+    conn = _connect_readonly()
+    try:
+        teams = {r[0].strip() for r in conn.execute(
+            "SELECT team1 FROM matches UNION SELECT team2 FROM matches") if r[0]}
+        people = {r[0].strip() for r in conn.execute(
+            "SELECT batter FROM deliveries UNION SELECT bowler FROM deliveries "
+            "UNION SELECT player_of_match FROM matches") if r[0]}
+        places = {r[0].strip() for r in conn.execute(
+            "SELECT venue FROM matches UNION SELECT city FROM matches") if r[0]}
+        return people, teams, places
+    finally:
+        conn.close()
+
+
+def get_dataset_summary() -> dict:
+    conn = _connect_readonly()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*), MIN(season), MAX(season), MIN(date), MAX(date) FROM matches"
+        ).fetchone()
+        deliveries = conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+        return {
+            "matches": row[0], "first_season": row[1], "last_season": row[2],
+            "first_date": row[3], "last_date": row[4], "deliveries": deliveries,
+        }
     finally:
         conn.close()
 

@@ -1,132 +1,102 @@
 import re
-from fastapi import APIRouter, HTTPException, Depends, status
-from pydantic import BaseModel
-from auth import hash_password, verify_password, create_access_token, get_current_user
-from auth_database import create_user, get_user_by_email, get_user_by_username, get_user_stats, check_user_limit
-from datetime import date
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+
+from auth import Identity, create_access_token, get_current_user, get_identity, hash_password, verify_password
+from auth_database import (
+    check_anon_limit, check_user_limit, create_user, get_user_by_email, get_user_by_username,
+    get_user_stats, touch_last_login,
+)
 
 router = APIRouter()
 
-# Simple email validation regex
-EMAIL_REGEX = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
+EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+USERNAME_REGEX = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+
 
 class SignupRequest(BaseModel):
-    email: str
-    username: str
-    password: str
+    email: str = Field(max_length=254)
+    username: str = Field(max_length=32)
+    password: str = Field(max_length=128)
+
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=254)
+    password: str = Field(max_length=128)
+
+
+def public_user(user: dict) -> dict:
+    return {
+        "id": user["id"],
+        "email": user["email"],
+        "username": user["username"],
+        "is_admin": bool(user.get("is_admin")),
+    }
+
+
+def _bad_request(detail: str):
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
 
 @router.post("/signup")
 def signup(body: SignupRequest):
-    email = body.email.strip()
+    email = body.email.strip().lower()
     username = body.username.strip()
-    password = body.password
 
-    # Validations
     if not EMAIL_REGEX.match(email):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid email format"
-        )
-    if len(username) < 3:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username must be at least 3 characters long"
-        )
-    if len(password) < 6:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 6 characters long"
-        )
-
-    # Check existence
+        _bad_request("Please enter a valid email address.")
+    if not USERNAME_REGEX.match(username):
+        _bad_request("Username must be 3–32 characters: letters, numbers, dot, dash or underscore.")
+    if len(body.password) < 8:
+        _bad_request("Password must be at least 8 characters long.")
     if get_user_by_email(email):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email is already registered"
-        )
+        _bad_request("An account with this email already exists.")
     if get_user_by_username(username):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username is already taken"
-        )
+        _bad_request("That username is taken.")
 
-    password_hash = hash_password(password)
     try:
-        user = create_user(email, username, password_hash)
+        user = create_user(email, username, hash_password(body.password))
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        _bad_request(str(e))
 
-    token = create_access_token({"sub": user["email"]})
+    touch_last_login(user["id"])
     return {
-        "access_token": token,
+        "access_token": create_access_token({"sub": user["email"]}),
         "token_type": "bearer",
-        "user": {
-            "id": user["id"],
-            "email": user["email"],
-            "username": user["username"]
-        }
+        "user": public_user(user),
     }
+
 
 @router.post("/login")
 def login(body: LoginRequest):
-    email = body.email.strip()
-    password = body.password
+    user = get_user_by_email(body.email.strip())
+    if not user or not verify_password(body.password, user["password_hash"]):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password.")
+    if not user["is_active"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account has been deactivated.")
 
-    user = get_user_by_email(email)
-    if not user or not verify_password(password, user["password_hash"]):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid email or password"
-        )
-
-    token = create_access_token({"sub": user["email"]})
+    touch_last_login(user["id"])
     return {
-        "access_token": token,
+        "access_token": create_access_token({"sub": user["email"]}),
         "token_type": "bearer",
-        "user": {
-            "id": user["id"],
-            "email": user["email"],
-            "username": user["username"]
-        }
+        "user": public_user(user),
     }
 
-def get_reset_date():
-    today = date.today()
-    if today.month == 12:
-        next_month = date(today.year + 1, 1, 1)
-    else:
-        next_month = date(today.year, today.month + 1, 1)
-    return next_month.strftime("%Y-%m-%d")
-
-def check_token_limit(current_user: dict = Depends(get_current_user)):
-    limit_info = check_user_limit(current_user["id"])
-    if not limit_info["allowed"]:
-        raise HTTPException(
-            status_code=429,
-            detail="Monthly limit reached (50,000 tokens). Usage resets on the 1st."
-        )
-    return current_user
 
 @router.get("/me")
 def get_me(current_user: dict = Depends(get_current_user)):
-    stats = get_user_stats(current_user["id"])
-    limit_info = check_user_limit(current_user["id"])
     return {
-        "id": current_user["id"],
-        "email": current_user["email"],
-        "username": current_user["username"],
-        "stats": {
-            "total_questions": stats["total_questions"],
-            "total_tokens": stats["total_tokens"]
-        },
-        "usage": {
-            "used_this_month": limit_info["used"],
-            "limit": limit_info["limit"],
-            "remaining": limit_info["remaining"],
-            "reset_date": get_reset_date()
-        }
+        **public_user(current_user),
+        "created_at": current_user.get("created_at"),
+        "stats": get_user_stats(current_user["id"]),
+        "usage": check_user_limit(current_user["id"]),
     }
+
+
+@router.get("/quota")
+def get_quota(identity: Identity = Depends(get_identity)):
+    """Remaining allowance for whoever is asking (token budget for users, question count for guests)."""
+    if identity.user:
+        return {"authenticated": True, **check_user_limit(identity.user_id)}
+    return {"authenticated": False, **check_anon_limit(identity.ip)}
