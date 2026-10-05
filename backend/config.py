@@ -53,7 +53,7 @@ REDIS_DB = _int("REDIS_DB", 0)
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
 LLM_FAST_MODEL = os.getenv("LLM_FAST_MODEL", LLM_MODEL)  # used for summaries
 LLM_TIMEOUT_SECONDS = _float("LLM_TIMEOUT_SECONDS", 30.0)
 LLM_MAX_RETRIES = _int("LLM_MAX_RETRIES", 2)

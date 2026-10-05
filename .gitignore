@@ -16,3 +16,4 @@ backend/users.db
 backend/users.db-*
 *.db-wal
 *.db-shm
+backend/*.backup
