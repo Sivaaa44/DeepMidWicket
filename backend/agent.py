@@ -69,9 +69,16 @@ def llm_client() -> groq.Groq:
     return _client
 
 
+def is_reasoning_model(model: str) -> bool:
+    return "gpt-oss" in (model or "").lower()
+
+
 def llm_call(usage: Usage, stage: str, **kwargs):
     """One chat completion with consistent error mapping and usage tracking."""
     kwargs.setdefault("model", config.LLM_MODEL)
+    if is_reasoning_model(kwargs["model"]):
+        kwargs.setdefault("reasoning_effort", config.LLM_REASONING_EFFORT)
+        kwargs.setdefault("include_reasoning", False)
     started = time.perf_counter()
     try:
         response = llm_client().chat.completions.create(**kwargs)
@@ -85,6 +92,15 @@ def llm_call(usage: Usage, stage: str, **kwargs):
         raise AgentError("llm_error", "The AI service returned an error. Please try again.", str(e)) from e
     usage.add(response.usage)
     log.info("[llm] stage=%s model=%s %.2fs", stage, kwargs["model"], time.perf_counter() - started)
+    choice = response.choices[0]
+    if getattr(choice, "finish_reason", None) == "length" and not kwargs.get("tools"):
+        # Output hit max_completion_tokens: the text is cut off mid-way and must not be used.
+        raise AgentError(
+            "llm_truncated",
+            "The AI model ran out of room before finishing. Try a narrower question.",
+            f"stage={stage} model={kwargs['model']} max_completion_tokens={kwargs.get('max_completion_tokens')} "
+            f"partial={(choice.message.content or '')[:200]!r}",
+        )
     return response
 
 
@@ -439,7 +455,7 @@ def build_sql_prompt(tool: str, args: dict, question: str) -> str:
 
 def generate_sql(prompt: str, usage: Usage) -> str:
     response = llm_call(usage, "sql", messages=[{"role": "user", "content": prompt}],
-                        temperature=0.1, max_completion_tokens=700)
+                        temperature=0.1, max_completion_tokens=config.MAX_TOKENS_SQL)
     return response.choices[0].message.content or ""
 
 
@@ -478,7 +494,7 @@ def generate_answer(question: str, guidance_key: str, columns, rows, context_str
         results=table,
     )
     response = llm_call(usage, "answer", messages=[{"role": "user", "content": prompt}],
-                        temperature=0.3, max_completion_tokens=260)
+                        temperature=0.3, max_completion_tokens=config.MAX_TOKENS_ANSWER)
     return (response.choices[0].message.content or "").strip()
 
 
@@ -487,7 +503,7 @@ def summarize(old_summary: str, messages: list[dict], usage: Usage) -> str:
     response = llm_call(
         usage, "summary", model=config.LLM_FAST_MODEL,
         messages=[{"role": "user", "content": SUMMARY_PROMPT.format(summary=old_summary or "(none)", messages=transcript)}],
-        temperature=0.2, max_completion_tokens=220,
+        temperature=0.2, max_completion_tokens=config.MAX_TOKENS_SUMMARY,
     )
     return (response.choices[0].message.content or "").strip()
 
@@ -525,7 +541,7 @@ def ask(question: str, session_id: str = None, on_event=None, context: dict = No
                 dataset=dataset_description(), question=question,
             )
             response = llm_call(usage, "chat", messages=[{"role": "user", "content": prompt}],
-                                temperature=0.4, max_completion_tokens=220)
+                                temperature=0.4, max_completion_tokens=config.MAX_TOKENS_ANSWER)
             result["answer"] = (response.choices[0].message.content or "").strip()
             timings["answer_ms"] = _ms(t)
         else:

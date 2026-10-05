@@ -266,6 +266,35 @@ class TestUnits(unittest.TestCase):
             with self.assertRaises(QueryError):
                 run_query(bad)
 
+    def _fake_client(self, finish_reason="stop", content="SELECT 1"):
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            msg = SimpleNamespace(content=content, tool_calls=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason=finish_reason)], usage=_usage())
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        return client, calls
+
+    def test_reasoning_models_get_effort_and_hidden_reasoning(self):
+        client, calls = self._fake_client()
+        with mock.patch.object(agent, "llm_client", return_value=client):
+            agent.llm_call(agent.Usage(), "sql", model="openai/gpt-oss-120b", messages=[])
+            agent.llm_call(agent.Usage(), "sql", model="llama-3.3-70b-versatile", messages=[])
+        self.assertEqual(calls[0]["reasoning_effort"], config.LLM_REASONING_EFFORT)
+        self.assertFalse(calls[0]["include_reasoning"])
+        self.assertNotIn("reasoning_effort", calls[1])
+
+    def test_truncated_output_is_an_error_not_bad_sql(self):
+        client, _ = self._fake_client(finish_reason="length", content="SELECT ROUND(S")
+        usage = agent.Usage()
+        with mock.patch.object(agent, "llm_client", return_value=client):
+            with self.assertRaises(agent.AgentError) as ctx:
+                agent.llm_call(usage, "sql", messages=[])
+        self.assertEqual(ctx.exception.code, "llm_truncated")
+        self.assertGreater(usage.as_dict()["total"], 0)  # tokens still billed
+
     def test_sanitise_strips_like_wildcards(self):
         self.assertEqual(agent.sanitise("Ko'hli%_"), "Kohli")
 
