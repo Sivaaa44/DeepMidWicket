@@ -2,10 +2,15 @@ import json
 import sqlite3
 import os
 import glob
+import sys
 
 # ── Config ──────────────────────────────────────────────────────────────────
-JSON_FOLDER = "./ipl_json"   # ← change this to wherever your JSON files are
-DB_PATH     = "./cricket.db"
+# Paths are anchored to this file, not the current directory, so the script
+# writes the same database the backend reads no matter where it is run from.
+# Override either with the IPL_JSON_FOLDER / CRICKET_DB_PATH env vars.
+ROOT_DIR    = os.path.dirname(os.path.abspath(__file__))
+JSON_FOLDER = os.getenv("IPL_JSON_FOLDER", os.path.join(ROOT_DIR, "ipl_json"))
+DB_PATH     = os.getenv("CRICKET_DB_PATH", os.path.join(ROOT_DIR, "backend", "cricket.db"))
 # ────────────────────────────────────────────────────────────────────────────
 
 def create_tables(conn):
@@ -175,6 +180,12 @@ def load_all(conn):
 
 
 if __name__ == "__main__":
+    # Bail out before touching the database: a wrong folder would otherwise
+    # leave behind an empty cricket.db that the backend happily serves.
+    if not glob.glob(os.path.join(JSON_FOLDER, "*.json")):
+        sys.exit(f"No match files found in {JSON_FOLDER} (set IPL_JSON_FOLDER to the folder of Cricsheet IPL JSON files)")
+
+    print(f"Writing {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     create_tables(conn)
     load_all(conn)
