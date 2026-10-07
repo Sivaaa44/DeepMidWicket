@@ -43,7 +43,7 @@ frontend/src/
   lib/viz.js       picks chart form from result shape; lib/format.js formatting helpers
   components/answer/   Answer.jsx dispatches to chart/comparison/head-to-head/tiles/table/SQL
   components/admin/    admin dashboard tabs
-data_loader.py     rebuilds cricket.db from ./ipl_json (not needed at runtime)
+data_loader.py     rebuilds backend/cricket.db from ./ipl_json, from any cwd (not needed at runtime)
 ```
 
 ## Architecture rules
